@@ -20,7 +20,6 @@ import { CheckpointReactor, type CheckpointReactorShape } from "../Services/Chec
 import { OrchestrationEngineService } from "../Services/OrchestrationEngine.ts";
 import { CheckpointStoreError } from "../../checkpointing/Errors.ts";
 import { OrchestrationDispatchError } from "../Errors.ts";
-import { isGitRepository } from "../../git/isRepo.ts";
 
 type ReactorInput =
   | {
@@ -145,7 +144,7 @@ const make = Effect.gen(function* () {
     return Option.none();
   });
 
-  const isGitWorkspace = (cwd: string) => isGitRepository(cwd);
+  const isGitWorkspace = (cwd: string) => checkpointStore.isGitRepository(cwd);
 
   const captureCheckpointFromTurnCompletion = Effect.fnUntraced(function* (
     event: Extract<ProviderRuntimeEvent, { type: "turn.completed" }>,
@@ -187,7 +186,7 @@ const make = Effect.gen(function* () {
       });
       return;
     }
-    if (!isGitWorkspace(checkpointCwd)) {
+    if (!(yield* isGitWorkspace(checkpointCwd))) {
       yield* Effect.logDebug("checkpoint capture skipped for non-git workspace", {
         threadId: thread.id,
         turnId,
@@ -222,7 +221,7 @@ const make = Effect.gen(function* () {
       checkpointRef: targetCheckpointRef,
     });
 
-    const files = yield* checkpointStore
+    const diff = yield* checkpointStore
       .diffCheckpoints({
         cwd: checkpointCwd,
         fromCheckpointRef,
@@ -230,14 +229,6 @@ const make = Effect.gen(function* () {
         fallbackFromToHead: false,
       })
       .pipe(
-        Effect.map((diff) =>
-          parseTurnDiffFilesFromUnifiedDiff(diff).map((file) => ({
-            path: file.path,
-            kind: "modified" as const,
-            additions: file.additions,
-            deletions: file.deletions,
-          })),
-        ),
         Effect.tapError((error) =>
           appendCaptureFailureActivity({
             threadId: thread.id,
@@ -252,9 +243,19 @@ const make = Effect.gen(function* () {
             turnId,
             turnCount: nextTurnCount,
             detail: error.message,
-          }).pipe(Effect.as([])),
+          }).pipe(Effect.as("")),
         ),
       );
+
+    const files =
+      diff.trim().length === 0
+        ? []
+        : parseTurnDiffFilesFromUnifiedDiff(diff).map((file) => ({
+            path: file.path,
+            kind: "modified" as const,
+            additions: file.additions,
+            deletions: file.deletions,
+          }));
 
     const assistantMessageId =
       thread.messages
@@ -272,6 +273,7 @@ const make = Effect.gen(function* () {
       checkpointRef: targetCheckpointRef,
       status: checkpointStatusFromRuntime(event.payload.state),
       files,
+      ...(diff.trim().length > 0 ? { diff } : {}),
       assistantMessageId,
       checkpointTurnCount: nextTurnCount,
       createdAt: now,
@@ -330,7 +332,7 @@ const make = Effect.gen(function* () {
       });
       return;
     }
-    if (!isGitWorkspace(checkpointCwd)) {
+    if (!(yield* isGitWorkspace(checkpointCwd))) {
       return;
     }
 
@@ -392,7 +394,7 @@ const make = Effect.gen(function* () {
       });
       return;
     }
-    if (!isGitWorkspace(checkpointCwd)) {
+    if (!(yield* isGitWorkspace(checkpointCwd))) {
       return;
     }
 
@@ -442,7 +444,7 @@ const make = Effect.gen(function* () {
       }).pipe(Effect.catch(() => Effect.void));
       return;
     }
-    if (!isGitWorkspace(sessionRuntime.value.cwd)) {
+    if (!(yield* isGitWorkspace(sessionRuntime.value.cwd))) {
       yield* appendRevertFailureActivity({
         threadId: event.payload.threadId,
         turnCount: event.payload.turnCount,

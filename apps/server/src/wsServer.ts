@@ -27,6 +27,7 @@ import {
   WsPush,
   WsResponse,
 } from "@t3tools/contracts";
+import { decodeWorkspaceHandle, localProjectLocation, projectRootPath } from "@t3tools/shared/workspace";
 import * as NodeHttpServer from "@effect/platform-node/NodeHttpServer";
 import {
   Cause,
@@ -42,6 +43,7 @@ import {
   Stream,
   Struct,
 } from "effect";
+import { runProcess } from "./processRunner";
 import { WebSocketServer, type WebSocket } from "ws";
 
 import { createLogger } from "./logger";
@@ -73,6 +75,8 @@ import {
 import { parseBase64DataUrl } from "./imageMime.ts";
 import { AnalyticsService } from "./telemetry/Services/AnalyticsService.ts";
 import { expandHomePath } from "./os-jank.ts";
+import { quotePosixShellArg, runSshCommand } from "./ssh.ts";
+import { ensureRemoteCodexAvailable } from "./remoteCodex.ts";
 
 /**
  * ServerShape - Service API for server lifecycle control.
@@ -324,20 +328,65 @@ export const createServer = Effect.fn(function* (): Effect.fn.Return<
       return normalizedWorkspaceRoot;
     });
 
+    const normalizeProjectLocation = Effect.fnUntraced(function* (
+      command:
+        | Extract<ClientOrchestrationCommand, { type: "project.create" }>
+        | Extract<ClientOrchestrationCommand, { type: "project.meta.update" }>,
+    ) {
+      const location =
+        command.location ??
+        (command.workspaceRoot ? localProjectLocation(command.workspaceRoot) : undefined);
+      if (!location) {
+        return {
+          workspaceRoot: command.workspaceRoot,
+          location: undefined,
+        } as const;
+      }
+
+      if (location.kind === "ssh") {
+        const normalizedHostAlias = location.hostAlias.trim();
+        const normalizedRootPath = location.rootPath.trim();
+        return {
+          workspaceRoot: projectRootPath({
+            ...location,
+            hostAlias: normalizedHostAlias,
+            rootPath: normalizedRootPath,
+          }),
+          location: {
+            ...location,
+            hostAlias: normalizedHostAlias,
+            rootPath: normalizedRootPath,
+          },
+        } as const;
+      }
+
+      const normalizedWorkspaceRoot = yield* normalizeProjectWorkspaceRoot(location.rootPath);
+      return {
+        workspaceRoot: normalizedWorkspaceRoot,
+        location: {
+          kind: "local" as const,
+          rootPath: normalizedWorkspaceRoot,
+        },
+      } as const;
+    });
+
     if (input.command.type === "project.create") {
+      const normalized = yield* normalizeProjectLocation(input.command);
       return {
         ...input.command,
-        workspaceRoot: yield* normalizeProjectWorkspaceRoot(input.command.workspaceRoot),
+        workspaceRoot: normalized.workspaceRoot ?? input.command.workspaceRoot,
+        ...(normalized.location ? { location: normalized.location } : {}),
       } satisfies OrchestrationCommand;
     }
 
-    if (
-      input.command.type === "project.meta.update" &&
-      input.command.workspaceRoot !== undefined
-    ) {
+    if (input.command.type === "project.meta.update") {
+      const normalized = yield* normalizeProjectLocation(input.command);
       return {
         ...input.command,
-        workspaceRoot: yield* normalizeProjectWorkspaceRoot(input.command.workspaceRoot),
+        ...(normalized.workspaceRoot !== undefined
+          ? { workspaceRoot: normalized.workspaceRoot }
+          : {}),
+        ...(normalized.location ? { location: normalized.location } : {}),
       } satisfies OrchestrationCommand;
     }
 
@@ -772,6 +821,46 @@ export const createServer = Effect.fn(function* (): Effect.fn.Return<
 
       case WS_METHODS.projectsWriteFile: {
         const body = stripRequestTag(request.body);
+        const workspaceTarget = decodeWorkspaceHandle(body.cwd);
+        if (workspaceTarget?.kind === "ssh") {
+          const relativePath = body.relativePath.trim().replaceAll("\\", "/");
+          const relativeDir =
+            relativePath.includes("/") ? relativePath.slice(0, relativePath.lastIndexOf("/")) : "";
+          if (
+            relativePath.length === 0 ||
+            relativePath.startsWith("/") ||
+            relativePath === "." ||
+            relativePath === ".." ||
+            relativePath.includes("../")
+          ) {
+            return yield* new RouteRequestError({
+              message: "Workspace file path must stay within the project root.",
+            });
+          }
+          yield* Effect.tryPromise({
+            try: () =>
+              runSshCommand({
+                hostAlias: workspaceTarget.hostAlias,
+                stateDir: serverConfig.stateDir,
+                timeoutMs: 20_000,
+                stdin: body.contents,
+                script: [
+                  `cd ${quotePosixShellArg(workspaceTarget.cwd)}`,
+                  ...(relativeDir.length > 0
+                    ? [`mkdir -p ${quotePosixShellArg(relativeDir)}`]
+                    : []),
+                  `tmp_file=$(mktemp ${quotePosixShellArg(`${relativePath}.tmp.XXXXXX`)})`,
+                  `cat > "$tmp_file"`,
+                  `mv "$tmp_file" ${quotePosixShellArg(relativePath)}`,
+                ].join(" && "),
+              }),
+            catch: (cause) =>
+              new RouteRequestError({
+                message: `Failed to write workspace file: ${String(cause)}`,
+              }),
+          });
+          return { relativePath };
+        }
         const target = yield* resolveWorkspaceWritePath({
           workspaceRoot: body.cwd,
           relativePath: body.relativePath,
@@ -794,6 +883,78 @@ export const createServer = Effect.fn(function* (): Effect.fn.Return<
           ),
         );
         return { relativePath: target.relativePath };
+      }
+
+      case WS_METHODS.projectsValidateSshTarget: {
+        const body = stripRequestTag(request.body);
+        yield* Effect.tryPromise({
+          try: () =>
+            runProcess("ssh", ["-G", body.hostAlias], {
+              cwd: serverConfig.cwd,
+              timeoutMs: 10_000,
+            }),
+          catch: (cause) =>
+            new RouteRequestError({
+              message: `Failed to resolve SSH host alias: ${String(cause)}`,
+            }),
+        });
+
+        const runValidationStep = (input: {
+          readonly script: string;
+          readonly failureMessage: string;
+        }) =>
+          Effect.tryPromise({
+            try: () =>
+              runSshCommand({
+                hostAlias: body.hostAlias,
+                stateDir: serverConfig.stateDir,
+                timeoutMs: 10_000,
+                script: input.script,
+              }),
+            catch: (cause) =>
+              new RouteRequestError({
+                message: `${input.failureMessage} ${String(cause)}`,
+              }),
+          });
+
+        yield* runValidationStep({
+          script: "printf ready >/dev/null",
+          failureMessage: `Failed to connect to SSH host '${body.hostAlias}'. Check host key trust and authentication.`,
+        });
+        yield* runValidationStep({
+          script: `test -d ${quotePosixShellArg(body.rootPath)}`,
+          failureMessage: `Remote path does not exist or is not a directory: ${body.hostAlias}:${body.rootPath}`,
+        });
+        yield* runValidationStep({
+          script: "command -v sh >/dev/null 2>&1",
+          failureMessage: `Remote host '${body.hostAlias}' does not have 'sh' on the login shell PATH.`,
+        });
+        yield* runValidationStep({
+          script: "command -v git >/dev/null 2>&1",
+          failureMessage: `Remote host '${body.hostAlias}' does not have 'git' on the login shell PATH.`,
+        });
+        const codexSetup = yield* Effect.tryPromise({
+          try: () =>
+            ensureRemoteCodexAvailable({
+              hostAlias: body.hostAlias,
+              stateDir: serverConfig.stateDir,
+              rootPath: body.rootPath,
+            }),
+          catch: (cause) =>
+            new RouteRequestError({
+              message:
+                cause instanceof Error
+                  ? cause.message
+                  : `Failed to set up Codex on remote host '${body.hostAlias}'.`,
+            }),
+        });
+        return {
+          hostAlias: body.hostAlias,
+          rootPath: body.rootPath,
+          ...(codexSetup.installMethod ? { codexInstalledBy: codexSetup.installMethod } : {}),
+          codexAuthStatus: codexSetup.authStatus,
+          ...(codexSetup.authMessage ? { codexAuthMessage: codexSetup.authMessage } : {}),
+        };
       }
 
       case WS_METHODS.shellOpenInEditor: {

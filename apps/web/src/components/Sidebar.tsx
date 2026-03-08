@@ -10,7 +10,10 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   DEFAULT_RUNTIME_MODE,
   DEFAULT_MODEL_BY_PROVIDER,
+  DEFAULT_TERMINAL_ID,
   type DesktopUpdateState,
+  type ProjectLocation,
+  type ProjectValidateSshTargetResult,
   ProjectId,
   ThreadId,
   type GitStatusResult,
@@ -18,6 +21,7 @@ import {
 } from "@t3tools/contracts";
 import { useMutation, useQueries, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useNavigate, useParams } from "@tanstack/react-router";
+import { workspaceHandleFromLocation } from "@t3tools/shared/workspace";
 import { useAppSettings } from "../appSettings";
 import { isElectron } from "../env";
 import { APP_STAGE_LABEL } from "../branding";
@@ -28,6 +32,7 @@ import { type Thread } from "../types";
 import { derivePendingApprovals } from "../session-logic";
 import { gitRemoveWorktreeMutationOptions, gitStatusQueryOptions } from "../lib/gitReactQuery";
 import { serverConfigQueryOptions } from "../lib/serverReactQuery";
+import { labelForProjectLocation, workspaceHandleForProject, workspaceHandleForThread } from "../lib/workspaceLocation";
 import { readNativeApi } from "../nativeApi";
 import { type DraftThreadEnvMode, useComposerDraftStore } from "../composerDraftStore";
 import { selectThreadTerminalState, useTerminalStateStore } from "../terminalStateStore";
@@ -58,6 +63,16 @@ import {
   SidebarSeparator,
   SidebarTrigger,
 } from "./ui/sidebar";
+import { Button } from "./ui/button";
+import {
+  Dialog,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogPanel,
+  DialogPopup,
+  DialogTitle,
+} from "./ui/dialog";
 import { formatWorktreePathForDisplay, getOrphanedWorktreePathForThread } from "../worktreeCleanup";
 import { isNonEmpty as isNonEmptyString } from "effect/String";
 
@@ -102,6 +117,16 @@ interface PrStatusIndicator {
 }
 
 type ThreadPr = GitStatusResult["pr"];
+type SshLocation = Extract<ProjectLocation, { kind: "ssh" }>;
+
+interface RemoteSetupDialogState {
+  readonly projectId: ProjectId;
+  readonly threadId: ThreadId;
+  readonly location: SshLocation;
+  readonly validation: ProjectValidateSshTargetResult;
+  readonly isRechecking: boolean;
+  readonly lastCheckError: string | null;
+}
 
 function hasUnseenCompletion(thread: Thread): boolean {
   if (!thread.latestTurn?.completedAt) return false;
@@ -257,6 +282,19 @@ function ProjectFavicon({ cwd }: { cwd: string }) {
   );
 }
 
+function isSameProjectLocation(left: ProjectLocation, right: ProjectLocation): boolean {
+  if (left.kind !== right.kind) {
+    return false;
+  }
+  if (left.rootPath !== right.rootPath) {
+    return false;
+  }
+  if (left.kind === "local") {
+    return true;
+  }
+  return right.kind === "ssh" && left.hostAlias === right.hostAlias;
+}
+
 export default function Sidebar() {
   const projects = useStore((store) => store.projects);
   const threads = useStore((store) => store.threads);
@@ -268,6 +306,8 @@ export default function Sidebar() {
   );
   const getDraftThread = useComposerDraftStore((store) => store.getDraftThread);
   const terminalStateByThreadId = useTerminalStateStore((state) => state.terminalStateByThreadId);
+  const setTerminalOpen = useTerminalStateStore((state) => state.setTerminalOpen);
+  const setActiveTerminal = useTerminalStateStore((state) => state.setActiveTerminal);
   const clearTerminalState = useTerminalStateStore((state) => state.clearTerminalState);
   const setProjectDraftThreadId = useComposerDraftStore((store) => store.setProjectDraftThreadId);
   const setDraftThreadContext = useComposerDraftStore((store) => store.setDraftThreadContext);
@@ -290,7 +330,10 @@ export default function Sidebar() {
   const queryClient = useQueryClient();
   const removeWorktreeMutation = useMutation(gitRemoveWorktreeMutationOptions({ queryClient }));
   const [addingProject, setAddingProject] = useState(false);
+  const [projectAddMode, setProjectAddMode] = useState<"local" | "ssh">("local");
   const [newCwd, setNewCwd] = useState("");
+  const [newRemoteHostAlias, setNewRemoteHostAlias] = useState("");
+  const [newRemoteRootPath, setNewRemoteRootPath] = useState("");
   const [isPickingFolder, setIsPickingFolder] = useState(false);
   const [isAddingProject, setIsAddingProject] = useState(false);
   const [renamingThreadId, setRenamingThreadId] = useState<ThreadId | null>(null);
@@ -301,6 +344,9 @@ export default function Sidebar() {
   const renamingCommittedRef = useRef(false);
   const renamingInputRef = useRef<HTMLInputElement | null>(null);
   const [desktopUpdateState, setDesktopUpdateState] = useState<DesktopUpdateState | null>(null);
+  const [remoteSetupDialogState, setRemoteSetupDialogState] = useState<RemoteSetupDialogState | null>(
+    null,
+  );
   const pendingApprovalByThreadId = useMemo(() => {
     const map = new Map<ThreadId, boolean>();
     for (const thread of threads) {
@@ -308,8 +354,8 @@ export default function Sidebar() {
     }
     return map;
   }, [threads]);
-  const projectCwdById = useMemo(
-    () => new Map(projects.map((project) => [project.id, project.cwd] as const)),
+  const projectById = useMemo(
+    () => new Map(projects.map((project) => [project.id, project] as const)),
     [projects],
   );
   const threadGitTargets = useMemo(
@@ -317,9 +363,11 @@ export default function Sidebar() {
       threads.map((thread) => ({
         threadId: thread.id,
         branch: thread.branch,
-        cwd: thread.worktreePath ?? projectCwdById.get(thread.projectId) ?? null,
+        cwd: projectById.get(thread.projectId)
+          ? workspaceHandleForThread(projectById.get(thread.projectId)!, thread)
+          : null,
       })),
-    [projectCwdById, threads],
+    [projectById, threads],
   );
   const threadGitStatusCwds = useMemo(
     () => [
@@ -390,7 +438,7 @@ export default function Sidebar() {
         worktreePath?: string | null;
         envMode?: DraftThreadEnvMode;
       },
-    ): Promise<void> => {
+    ): Promise<ThreadId> => {
       const hasBranchOption = options?.branch !== undefined;
       const hasWorktreePathOption = options?.worktreePath !== undefined;
       const hasEnvModeOption = options?.envMode !== undefined;
@@ -406,12 +454,13 @@ export default function Sidebar() {
           }
           setProjectDraftThreadId(projectId, storedDraftThread.threadId);
           if (routeThreadId === storedDraftThread.threadId) {
-            return;
+            return storedDraftThread.threadId;
           }
           await navigate({
             to: "/$threadId",
             params: { threadId: storedDraftThread.threadId },
           });
+          return storedDraftThread.threadId;
         })();
       }
       clearProjectDraftThreadId(projectId);
@@ -426,7 +475,7 @@ export default function Sidebar() {
           });
         }
         setProjectDraftThreadId(projectId, routeThreadId);
-        return Promise.resolve();
+        return Promise.resolve(routeThreadId);
       }
       const threadId = newThreadId();
       const createdAt = new Date().toISOString();
@@ -443,6 +492,7 @@ export default function Sidebar() {
           to: "/$threadId",
           params: { threadId },
         });
+        return threadId;
       })();
     },
     [
@@ -455,6 +505,87 @@ export default function Sidebar() {
       setProjectDraftThreadId,
     ],
   );
+
+  const openCodexLoginTerminal = useCallback(
+    async (input: { threadId: ThreadId; location: ProjectLocation }) => {
+      const api = readNativeApi();
+      if (!api) {
+        throw new Error("Terminal API unavailable.");
+      }
+
+      setTerminalOpen(input.threadId, true);
+      setActiveTerminal(input.threadId, DEFAULT_TERMINAL_ID);
+
+      const cwd = workspaceHandleFromLocation(input.location);
+      await navigate({
+        to: "/$threadId",
+        params: { threadId: input.threadId },
+      });
+      await api.terminal.open({
+        threadId: input.threadId,
+        terminalId: DEFAULT_TERMINAL_ID,
+        cwd,
+      });
+      await api.terminal.write({
+        threadId: input.threadId,
+        terminalId: DEFAULT_TERMINAL_ID,
+        data: "codex login\r",
+      });
+    },
+    [navigate, setActiveTerminal, setTerminalOpen],
+  );
+
+  const closeRemoteSetupDialog = useCallback(() => {
+    setRemoteSetupDialogState(null);
+  }, []);
+
+  const recheckRemoteSetup = useCallback(async () => {
+    const api = readNativeApi();
+    if (!api) return;
+
+    const currentState = remoteSetupDialogState;
+    if (!currentState || currentState.isRechecking) {
+      return;
+    }
+
+    setRemoteSetupDialogState((state) =>
+      state
+        ? {
+            ...state,
+            isRechecking: true,
+            lastCheckError: null,
+          }
+        : state,
+    );
+
+    try {
+      const validation = await api.projects.validateSshTarget({
+        hostAlias: currentState.location.hostAlias,
+        rootPath: currentState.location.rootPath,
+      });
+      setRemoteSetupDialogState((state) =>
+        state
+          ? {
+              ...state,
+              validation,
+              isRechecking: false,
+              lastCheckError: null,
+            }
+          : state,
+      );
+    } catch (error) {
+      setRemoteSetupDialogState((state) =>
+        state
+          ? {
+              ...state,
+              isRechecking: false,
+              lastCheckError:
+                error instanceof Error ? error.message : "Remote setup re-check failed.",
+            }
+          : state,
+      );
+    }
+  }, [remoteSetupDialogState]);
 
   const focusMostRecentThreadForProject = useCallback(
     (projectId: ProjectId) => {
@@ -475,10 +606,12 @@ export default function Sidebar() {
     [navigate, threads],
   );
 
-  const addProjectFromPath = useCallback(
-    async (rawCwd: string) => {
-      const cwd = rawCwd.trim();
-      if (!cwd || isAddingProject) return;
+  const addProject = useCallback(
+    async (location: ProjectLocation) => {
+      const cwd = location.rootPath.trim();
+      if (!cwd || isAddingProject) {
+        return;
+      }
       const api = readNativeApi();
       if (!api) return;
 
@@ -486,10 +619,13 @@ export default function Sidebar() {
       const finishAddingProject = () => {
         setIsAddingProject(false);
         setNewCwd("");
+        setNewRemoteHostAlias("");
+        setNewRemoteRootPath("");
+        setProjectAddMode("local");
         setAddingProject(false);
       };
 
-      const existing = projects.find((project) => project.cwd === cwd);
+      const existing = projects.find((project) => isSameProjectLocation(project.location, location));
       if (existing) {
         focusMostRecentThreadForProject(existing.id);
         finishAddingProject();
@@ -498,18 +634,39 @@ export default function Sidebar() {
 
       const projectId = newProjectId();
       const createdAt = new Date().toISOString();
-      const title = cwd.split(/[/\\]/).findLast(isNonEmptyString) ?? cwd;
+      let sshValidation: ProjectValidateSshTargetResult | null = null;
+      const title =
+        location.kind === "ssh"
+          ? location.rootPath.split("/").findLast(isNonEmptyString) ?? location.rootPath
+          : cwd.split(/[/\\]/).findLast(isNonEmptyString) ?? cwd;
       try {
+        if (location.kind === "ssh") {
+          sshValidation = await api.projects.validateSshTarget({
+            hostAlias: location.hostAlias,
+            rootPath: location.rootPath,
+          });
+        }
         await api.orchestration.dispatchCommand({
           type: "project.create",
           commandId: newCommandId(),
           projectId,
           title,
-          workspaceRoot: cwd,
+          workspaceRoot: location.rootPath,
+          location,
           defaultModel: DEFAULT_MODEL_BY_PROVIDER.codex,
           createdAt,
         });
-        await handleNewThread(projectId).catch(() => undefined);
+        const threadId = await handleNewThread(projectId).catch(() => undefined);
+        if (location.kind === "ssh" && threadId && sshValidation) {
+          setRemoteSetupDialogState({
+            projectId,
+            threadId,
+            location,
+            validation: sshValidation,
+            isRechecking: false,
+            lastCheckError: null,
+          });
+        }
       } catch (error) {
         setIsAddingProject(false);
         toastManager.add({
@@ -526,7 +683,18 @@ export default function Sidebar() {
   );
 
   const handleAddProject = () => {
-    void addProjectFromPath(newCwd);
+    if (projectAddMode === "ssh") {
+      void addProject({
+        kind: "ssh",
+        hostAlias: newRemoteHostAlias.trim(),
+        rootPath: newRemoteRootPath.trim(),
+      });
+      return;
+    }
+    void addProject({
+      kind: "local",
+      rootPath: newCwd.trim(),
+    });
   };
 
   const handlePickFolder = async () => {
@@ -540,7 +708,10 @@ export default function Sidebar() {
       // Ignore picker failures and leave the current thread selection unchanged.
     }
     if (pickedPath) {
-      await addProjectFromPath(pickedPath);
+      await addProject({
+        kind: "local",
+        rootPath: pickedPath,
+      });
     }
     setIsPickingFolder(false);
   };
@@ -715,7 +886,7 @@ export default function Sidebar() {
 
       try {
         await removeWorktreeMutation.mutateAsync({
-          cwd: threadProject.cwd,
+          cwd: workspaceHandleForProject(threadProject),
           path: orphanedWorktreePath,
           force: true,
         });
@@ -723,7 +894,7 @@ export default function Sidebar() {
         const message = error instanceof Error ? error.message : "Unknown error removing worktree.";
         console.error("Failed to remove orphaned worktree after thread deletion", {
           threadId,
-          projectCwd: threadProject.cwd,
+          projectCwd: workspaceHandleForProject(threadProject),
           worktreePath: orphanedWorktreePath,
           error,
         });
@@ -1073,9 +1244,18 @@ export default function Sidebar() {
                             project.expanded ? "rotate-90" : ""
                           }`}
                         />
-                        <ProjectFavicon cwd={project.cwd} />
-                        <span className="flex-1 truncate text-xs font-medium text-foreground/90">
-                          {project.name}
+                        {project.location.kind === "local" ? (
+                          <ProjectFavicon cwd={project.cwd} />
+                        ) : (
+                          <FolderIcon className="size-3.5 shrink-0 text-muted-foreground/50" />
+                        )}
+                        <span className="flex min-w-0 flex-1 flex-col text-left">
+                          <span className="truncate text-xs font-medium text-foreground/90">
+                            {project.name}
+                          </span>
+                          <span className="truncate text-[10px] text-muted-foreground/60">
+                            {labelForProjectLocation(project)}
+                          </span>
                         </span>
                       </CollapsibleTrigger>
                       <Tooltip>
@@ -1303,25 +1483,78 @@ export default function Sidebar() {
             <p className="mb-2 text-[10px] font-medium uppercase tracking-wider text-muted-foreground/70">
               Add project
             </p>
-            <input
-              className="mb-2 w-full rounded-md border border-border bg-secondary px-2 py-1.5 font-mono text-xs text-foreground placeholder:text-muted-foreground/40 focus:border-ring focus:outline-none"
-              placeholder="/path/to/project"
-              value={newCwd}
-              onChange={(event) => setNewCwd(event.target.value)}
-              onKeyDown={(event) => {
-                if (event.key === "Enter") handleAddProject();
-                if (event.key === "Escape") setAddingProject(false);
-              }}
-            />
-            {isElectron && (
+            <div className="mb-2 flex gap-2">
               <button
                 type="button"
-                className="mb-2 flex w-full items-center justify-center rounded-md border border-border px-2 py-1.5 text-xs text-muted-foreground transition-colors duration-150 hover:bg-secondary disabled:cursor-not-allowed disabled:opacity-60"
-                onClick={() => void handlePickFolder()}
-                disabled={isPickingFolder || isAddingProject}
+                className={`flex-1 rounded-md border px-2 py-1 text-xs ${
+                  projectAddMode === "local"
+                    ? "border-primary bg-primary/10 text-foreground"
+                    : "border-border text-muted-foreground/80 hover:bg-secondary"
+                }`}
+                onClick={() => setProjectAddMode("local")}
+                disabled={isAddingProject}
               >
-                {isPickingFolder ? "Picking folder..." : "Browse for folder"}
+                Local
               </button>
+              <button
+                type="button"
+                className={`flex-1 rounded-md border px-2 py-1 text-xs ${
+                  projectAddMode === "ssh"
+                    ? "border-primary bg-primary/10 text-foreground"
+                    : "border-border text-muted-foreground/80 hover:bg-secondary"
+                }`}
+                onClick={() => setProjectAddMode("ssh")}
+                disabled={isAddingProject}
+              >
+                SSH
+              </button>
+            </div>
+            {projectAddMode === "ssh" ? (
+              <>
+                <input
+                  className="mb-2 w-full rounded-md border border-border bg-secondary px-2 py-1.5 font-mono text-xs text-foreground placeholder:text-muted-foreground/40 focus:border-ring focus:outline-none"
+                  placeholder="ssh host alias"
+                  value={newRemoteHostAlias}
+                  onChange={(event) => setNewRemoteHostAlias(event.target.value)}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter") handleAddProject();
+                    if (event.key === "Escape") setAddingProject(false);
+                  }}
+                />
+                <input
+                  className="mb-2 w-full rounded-md border border-border bg-secondary px-2 py-1.5 font-mono text-xs text-foreground placeholder:text-muted-foreground/40 focus:border-ring focus:outline-none"
+                  placeholder="/absolute/remote/path"
+                  value={newRemoteRootPath}
+                  onChange={(event) => setNewRemoteRootPath(event.target.value)}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter") handleAddProject();
+                    if (event.key === "Escape") setAddingProject(false);
+                  }}
+                />
+              </>
+            ) : (
+              <>
+                <input
+                  className="mb-2 w-full rounded-md border border-border bg-secondary px-2 py-1.5 font-mono text-xs text-foreground placeholder:text-muted-foreground/40 focus:border-ring focus:outline-none"
+                  placeholder="/path/to/project"
+                  value={newCwd}
+                  onChange={(event) => setNewCwd(event.target.value)}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter") handleAddProject();
+                    if (event.key === "Escape") setAddingProject(false);
+                  }}
+                />
+                {isElectron && (
+                  <button
+                    type="button"
+                    className="mb-2 flex w-full items-center justify-center rounded-md border border-border px-2 py-1.5 text-xs text-muted-foreground transition-colors duration-150 hover:bg-secondary disabled:cursor-not-allowed disabled:opacity-60"
+                    onClick={() => void handlePickFolder()}
+                    disabled={isPickingFolder || isAddingProject}
+                  >
+                    {isPickingFolder ? "Picking folder..." : "Browse for folder"}
+                  </button>
+                )}
+              </>
             )}
             <div className="flex gap-2">
               <button
@@ -1351,6 +1584,126 @@ export default function Sidebar() {
           </button>
         )}
       </SidebarFooter>
+      <Dialog open={remoteSetupDialogState !== null} onOpenChange={(open) => !open && closeRemoteSetupDialog()}>
+        {remoteSetupDialogState && (
+          <DialogPopup className="max-w-xl" showCloseButton={remoteSetupDialogState.validation.codexAuthStatus !== "unauthenticated"}>
+            <DialogHeader>
+              <DialogTitle>Remote Setup</DialogTitle>
+              <DialogDescription>
+                Finish configuring this SSH project before you start chatting.
+              </DialogDescription>
+            </DialogHeader>
+            <DialogPanel className="space-y-4">
+              <div className="rounded-xl border border-border bg-secondary/35 p-3">
+                <p className="text-[11px] font-medium uppercase tracking-[0.16em] text-muted-foreground/70">
+                  Target
+                </p>
+                <p className="mt-1 break-all font-mono text-xs text-foreground">
+                  {remoteSetupDialogState.location.hostAlias}:{remoteSetupDialogState.location.rootPath}
+                </p>
+              </div>
+
+              <div className="space-y-3">
+                <div className="rounded-xl border border-border p-3">
+                  <div className="flex items-start justify-between gap-3">
+                    <div>
+                      <p className="text-sm font-medium text-foreground">Codex CLI</p>
+                      <p className="mt-1 text-xs text-muted-foreground">
+                        {remoteSetupDialogState.validation.codexInstalledBy
+                          ? `Installed automatically via ${remoteSetupDialogState.validation.codexInstalledBy}.`
+                          : "Already available on the remote host PATH."}
+                      </p>
+                    </div>
+                    <span className="rounded-full border border-emerald-500/20 bg-emerald-500/10 px-2 py-0.5 text-[10px] font-medium text-emerald-600 dark:text-emerald-300">
+                      Ready
+                    </span>
+                  </div>
+                </div>
+
+                <div className="rounded-xl border border-border p-3">
+                  <div className="flex items-start justify-between gap-3">
+                    <div>
+                      <p className="text-sm font-medium text-foreground">Authentication</p>
+                      <p className="mt-1 text-xs text-muted-foreground">
+                        {remoteSetupDialogState.validation.codexAuthStatus === "authenticated"
+                          ? "Remote Codex is signed in and ready."
+                          : remoteSetupDialogState.validation.codexAuthStatus === "unauthenticated"
+                            ? (remoteSetupDialogState.validation.codexAuthMessage ??
+                              "Remote Codex still needs `codex login`.")
+                            : (remoteSetupDialogState.validation.codexAuthMessage ??
+                              "Authentication could not be verified automatically.")}
+                      </p>
+                    </div>
+                    <span
+                      className={`rounded-full border px-2 py-0.5 text-[10px] font-medium ${
+                        remoteSetupDialogState.validation.codexAuthStatus === "authenticated"
+                          ? "border-emerald-500/20 bg-emerald-500/10 text-emerald-600 dark:text-emerald-300"
+                          : remoteSetupDialogState.validation.codexAuthStatus === "unauthenticated"
+                            ? "border-amber-500/20 bg-amber-500/10 text-amber-700 dark:text-amber-300"
+                            : "border-border bg-secondary text-muted-foreground"
+                      }`}
+                    >
+                      {remoteSetupDialogState.validation.codexAuthStatus === "authenticated"
+                        ? "Signed in"
+                        : remoteSetupDialogState.validation.codexAuthStatus === "unauthenticated"
+                          ? "Sign in required"
+                          : "Unknown"}
+                    </span>
+                  </div>
+                </div>
+              </div>
+
+              {remoteSetupDialogState.lastCheckError && (
+                <div className="rounded-xl border border-destructive/25 bg-destructive/8 p-3 text-xs text-destructive">
+                  {remoteSetupDialogState.lastCheckError}
+                </div>
+              )}
+
+              <div className="rounded-xl border border-dashed border-border p-3 text-xs text-muted-foreground">
+                Sign in opens the built-in terminal on this remote project and runs <code>codex login</code> for you.
+                After completing login there, come back here and click Re-check.
+              </div>
+            </DialogPanel>
+            <DialogFooter>
+              <div className="flex w-full flex-col-reverse gap-2 sm:flex-row sm:justify-between">
+                <div className="flex flex-col-reverse gap-2 sm:flex-row">
+                  <Button variant="outline" onClick={closeRemoteSetupDialog}>
+                    {remoteSetupDialogState.validation.codexAuthStatus === "authenticated"
+                      ? "Continue"
+                      : "Close"}
+                  </Button>
+                  <Button
+                    variant="outline"
+                    onClick={() => void recheckRemoteSetup()}
+                    disabled={remoteSetupDialogState.isRechecking}
+                  >
+                    {remoteSetupDialogState.isRechecking ? "Re-checking..." : "Re-check"}
+                  </Button>
+                </div>
+                <Button
+                  onClick={() => {
+                    void openCodexLoginTerminal({
+                      threadId: remoteSetupDialogState.threadId,
+                      location: remoteSetupDialogState.location,
+                    }).catch((error) => {
+                      toastManager.add({
+                        type: "error",
+                        title: "Unable to start remote login",
+                        description:
+                          error instanceof Error
+                            ? error.message
+                            : "An error occurred while opening the remote terminal.",
+                      });
+                    });
+                  }}
+                >
+                  Sign In In Terminal
+                </Button>
+              </div>
+            </DialogFooter>
+          </DialogPopup>
+        )}
+      </Dialog>
     </>
   );
 }

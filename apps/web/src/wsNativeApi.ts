@@ -142,6 +142,7 @@ export function createWsNativeApi(): NativeApi {
     projects: {
       searchEntries: (input) => transport.request(WS_METHODS.projectsSearchEntries, input),
       writeFile: (input) => transport.request(WS_METHODS.projectsWriteFile, input),
+      validateSshTarget: (input) => transport.request(WS_METHODS.projectsValidateSshTarget, input),
     },
     shell: {
       openInEditor: (cwd, editor) =>

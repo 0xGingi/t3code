@@ -23,7 +23,7 @@ export interface AppState {
   threadsHydrated: boolean;
 }
 
-const PERSISTED_STATE_KEY = "t3code:renderer-state:v8";
+const PERSISTED_STATE_KEY = "t3code:renderer-state:v9";
 const LEGACY_PERSISTED_STATE_KEYS = [
   "t3code:renderer-state:v6",
   "t3code:renderer-state:v5",
@@ -40,7 +40,7 @@ const initialState: AppState = {
   threads: [],
   threadsHydrated: false,
 };
-const persistedExpandedProjectCwds = new Set<string>();
+const persistedExpandedProjectIds = new Set<string>();
 
 // ── Persist helpers ──────────────────────────────────────────────────
 
@@ -49,11 +49,11 @@ function readPersistedState(): AppState {
   try {
     const raw = window.localStorage.getItem(PERSISTED_STATE_KEY);
     if (!raw) return initialState;
-    const parsed = JSON.parse(raw) as { expandedProjectCwds?: string[] };
-    persistedExpandedProjectCwds.clear();
-    for (const cwd of parsed.expandedProjectCwds ?? []) {
-      if (typeof cwd === "string" && cwd.length > 0) {
-        persistedExpandedProjectCwds.add(cwd);
+    const parsed = JSON.parse(raw) as { expandedProjectIds?: string[] };
+    persistedExpandedProjectIds.clear();
+    for (const projectId of parsed.expandedProjectIds ?? []) {
+      if (typeof projectId === "string" && projectId.length > 0) {
+        persistedExpandedProjectIds.add(projectId);
       }
     }
     return { ...initialState };
@@ -68,9 +68,9 @@ function persistState(state: AppState): void {
     window.localStorage.setItem(
       PERSISTED_STATE_KEY,
       JSON.stringify({
-        expandedProjectCwds: state.projects
+        expandedProjectIds: state.projects
           .filter((project) => project.expanded)
-          .map((project) => project.cwd),
+          .map((project) => project.id),
       }),
     );
     for (const legacyKey of LEGACY_PERSISTED_STATE_KEYS) {
@@ -105,18 +105,21 @@ function mapProjectsFromReadModel(
   return incoming.map((project) => {
     const existing =
       previous.find((entry) => entry.id === project.id) ??
-      previous.find((entry) => entry.cwd === project.workspaceRoot);
+      (project.location.kind === "local"
+        ? previous.find((entry) => entry.location.kind === "local" && entry.cwd === project.workspaceRoot)
+        : undefined);
     return {
       id: project.id,
       name: project.title,
       cwd: project.workspaceRoot,
+      location: project.location,
       model:
         existing?.model ??
         resolveModelSlug(project.defaultModel ?? DEFAULT_MODEL_BY_PROVIDER.codex),
       expanded:
         existing?.expanded ??
-        (persistedExpandedProjectCwds.size > 0
-          ? persistedExpandedProjectCwds.has(project.workspaceRoot)
+        (persistedExpandedProjectIds.size > 0
+          ? persistedExpandedProjectIds.has(project.id)
           : true),
       scripts: project.scripts.map((script) => ({ ...script })),
     };
@@ -271,6 +274,7 @@ export function syncServerReadModel(state: AppState, readModel: OrchestrationRea
           turnId: checkpoint.turnId,
           completedAt: checkpoint.completedAt,
           status: checkpoint.status,
+          ...(typeof checkpoint.diff === "string" ? { diff: checkpoint.diff } : {}),
           assistantMessageId: checkpoint.assistantMessageId ?? undefined,
           checkpointTurnCount: checkpoint.checkpointTurnCount,
           checkpointRef: checkpoint.checkpointRef,

@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 
 import { Effect, FileSystem, Layer, Option, Path, Schema, Stream } from "effect";
 import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process";
+import { decodeWorkspaceHandle } from "@t3tools/shared/workspace";
 
 import { sanitizeBranchFragment, sanitizeFeatureBranchName } from "@t3tools/shared/git";
 
@@ -204,6 +205,7 @@ const makeCodexTextGeneration = Effect.gen(function* () {
       const outputPath = yield* writeTempFile(operation, "codex-output", "");
 
       const runCodexCommand = Effect.gen(function* () {
+        const workspaceTarget = decodeWorkspaceHandle(cwd);
         const command = ChildProcess.make(
           "codex",
           [
@@ -223,7 +225,7 @@ const makeCodexTextGeneration = Effect.gen(function* () {
             "-",
           ],
           {
-            cwd,
+            cwd: workspaceTarget?.kind === "local" ? workspaceTarget.cwd : serverConfig.cwd,
             shell: process.platform === "win32",
             stdin: {
               stream: Stream.make(new TextEncoder().encode(prompt)),

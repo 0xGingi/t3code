@@ -23,6 +23,10 @@
     "./Net": {
       "types": "./src/Net.ts",
       "import": "./src/Net.ts"
+    },
+    "./workspace": {
+      "types": "./src/workspace.ts",
+      "import": "./src/workspace.ts"
     }
   },
   "scripts": {

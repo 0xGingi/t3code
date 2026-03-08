@@ -1,4 +1,5 @@
-import { Cache, Data, Duration, Effect, Exit, FileSystem, Layer, Path } from "effect";
+import { Cache, Data, Duration, Effect, Exit, FileSystem, Layer } from "effect";
+import { decodeWorkspaceHandle } from "@t3tools/shared/workspace";
 
 import { GitCommandError } from "../Errors.ts";
 import { GitService } from "../Services/GitService.ts";
@@ -185,10 +186,26 @@ function createGitCommandError(
   });
 }
 
+function defaultWorktreePath(cwd: string, newBranch: string): string {
+  const sanitizedBranch = newBranch.replace(/\//g, "-");
+  const workspaceTarget = decodeWorkspaceHandle(cwd);
+
+  if (workspaceTarget?.kind === "ssh") {
+    const segments = workspaceTarget.cwd.split("/").filter(Boolean);
+    const repoName = segments.at(-1) ?? "repo";
+    const parentDir = segments.slice(0, -1);
+    const parentPath = parentDir.length > 0 ? `/${parentDir.join("/")}` : "/";
+    return `${parentPath}/.t3-worktrees/${repoName}/${sanitizedBranch}`;
+  }
+
+  const repoName = cwd.match(/[^\\/]+$/)?.[0] ?? "repo";
+  const homeDir = process.env.HOME ?? process.env.USERPROFILE ?? "/tmp";
+  return `${homeDir}/.t3/worktrees/${repoName}/${sanitizedBranch}`;
+}
+
 const makeGitCore = Effect.gen(function* () {
   const git = yield* GitService;
   const fileSystem = yield* FileSystem.FileSystem;
-  const path = yield* Path.Path;
 
   const executeGit = (
     operation: string,
@@ -1015,11 +1032,7 @@ const makeGitCore = Effect.gen(function* () {
 
   const createWorktree: GitCoreShape["createWorktree"] = (input) =>
     Effect.gen(function* () {
-      const sanitizedBranch = input.newBranch.replace(/\//g, "-");
-      const repoName = path.basename(input.cwd);
-      const homeDir = process.env.HOME ?? process.env.USERPROFILE ?? "/tmp";
-      const worktreePath =
-        input.path ?? path.join(homeDir, ".t3", "worktrees", repoName, sanitizedBranch);
+      const worktreePath = input.path ?? defaultWorktreePath(input.cwd, input.newBranch);
 
       yield* executeGit(
         "GitCore.createWorktree",

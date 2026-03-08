@@ -5,6 +5,7 @@ import {
   NonNegativeInt,
   OrchestrationCheckpointFile,
   OrchestrationReadModel,
+  ProjectLocation,
   ProjectScript,
   TurnId,
   type OrchestrationCheckpointSummary,
@@ -43,6 +44,7 @@ import {
 const decodeReadModel = Schema.decodeUnknownEffect(OrchestrationReadModel);
 const ProjectionProjectDbRowSchema = ProjectionProject.mapFields(
   Struct.assign({
+    location: Schema.fromJsonString(ProjectLocation),
     scripts: Schema.fromJsonString(Schema.Array(ProjectScript)),
   }),
 );
@@ -137,6 +139,10 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
           project_id AS "projectId",
           title,
           workspace_root AS "workspaceRoot",
+          COALESCE(
+            location_json,
+            json_object('kind', 'local', 'rootPath', workspace_root)
+          ) AS "location",
           default_model AS "defaultModel",
           scripts_json AS "scripts",
           created_at AS "createdAt",
@@ -264,6 +270,7 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
           checkpoint_ref AS "checkpointRef",
           checkpoint_status AS "status",
           checkpoint_files_json AS "files",
+          checkpoint_diff_text AS "diff",
           assistant_message_id AS "assistantMessageId",
           completed_at AS "completedAt"
         FROM projection_turns
@@ -466,6 +473,7 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
               checkpointRef: row.checkpointRef,
               status: row.status,
               files: row.files,
+              ...(row.diff !== null ? { diff: row.diff } : {}),
               assistantMessageId: row.assistantMessageId,
               completedAt: row.completedAt,
             });
@@ -517,6 +525,7 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
             id: row.projectId,
             title: row.title,
             workspaceRoot: row.workspaceRoot,
+            location: row.location,
             defaultModel: row.defaultModel,
             scripts: row.scripts,
             createdAt: row.createdAt,

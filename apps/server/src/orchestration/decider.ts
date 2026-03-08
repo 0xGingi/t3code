@@ -4,6 +4,7 @@ import type {
   OrchestrationReadModel,
 } from "@t3tools/contracts";
 import { Effect } from "effect";
+import { localProjectLocation, projectRootPath } from "@t3tools/shared/workspace";
 
 import { OrchestrationCommandInvariantError } from "./Errors.ts";
 import {
@@ -77,6 +78,7 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
           projectId: command.projectId,
           title: command.title,
           workspaceRoot: command.workspaceRoot,
+          location: command.location ?? localProjectLocation(command.workspaceRoot),
           defaultModel: command.defaultModel ?? null,
           scripts: [],
           createdAt: command.createdAt,
@@ -104,6 +106,12 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
           projectId: command.projectId,
           ...(command.title !== undefined ? { title: command.title } : {}),
           ...(command.workspaceRoot !== undefined ? { workspaceRoot: command.workspaceRoot } : {}),
+          ...(command.location !== undefined
+            ? {
+                location: command.location,
+                workspaceRoot: projectRootPath(command.location),
+              }
+            : {}),
           ...(command.defaultModel !== undefined ? { defaultModel: command.defaultModel } : {}),
           ...(command.scripts !== undefined ? { scripts: command.scripts } : {}),
           updatedAt: occurredAt,
@@ -551,6 +559,7 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
           checkpointRef: command.checkpointRef,
           status: command.status,
           files: command.files,
+          ...(command.diff !== undefined ? { diff: command.diff } : {}),
           assistantMessageId: command.assistantMessageId ?? null,
           completedAt: command.completedAt,
         },

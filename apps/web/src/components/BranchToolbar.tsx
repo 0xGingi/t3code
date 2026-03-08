@@ -1,4 +1,5 @@
 import type { ThreadId } from "@t3tools/contracts";
+import { workspaceHandleFromLocation } from "@t3tools/shared/workspace";
 import { useCallback } from "react";
 
 import { newCommandId } from "../lib/utils";
@@ -38,7 +39,9 @@ export default function BranchToolbar({
   const activeThreadId = serverThread?.id ?? (draftThread ? threadId : undefined);
   const activeThreadBranch = serverThread?.branch ?? draftThread?.branch ?? null;
   const activeWorktreePath = serverThread?.worktreePath ?? draftThread?.worktreePath ?? null;
-  const branchCwd = activeWorktreePath ?? activeProject?.cwd ?? null;
+  const branchCwd = activeProject
+    ? workspaceHandleFromLocation(activeProject.location, activeWorktreePath ?? activeProject.cwd)
+    : null;
   const hasServerThread = serverThread !== undefined;
   const effectiveEnvMode = resolveEffectiveEnvMode({
     activeWorktreePath,

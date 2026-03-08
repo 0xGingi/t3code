@@ -6,6 +6,7 @@ import {
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { Effect, FileSystem, Layer, Option, Path, Stream } from "effect";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
+import { localProjectLocation } from "@t3tools/shared/workspace";
 
 import { toPersistenceSqlError, type ProjectionRepositoryError } from "../../persistence/Errors.ts";
 import { OrchestrationEventStore } from "../../persistence/Services/OrchestrationEventStore.ts";
@@ -364,6 +365,7 @@ const makeOrchestrationProjectionPipeline = Effect.gen(function* () {
             projectId: event.payload.projectId,
             title: event.payload.title,
             workspaceRoot: event.payload.workspaceRoot,
+            location: event.payload.location ?? localProjectLocation(event.payload.workspaceRoot),
             defaultModel: event.payload.defaultModel,
             scripts: event.payload.scripts,
             createdAt: event.payload.createdAt,
@@ -385,6 +387,7 @@ const makeOrchestrationProjectionPipeline = Effect.gen(function* () {
             ...(event.payload.workspaceRoot !== undefined
               ? { workspaceRoot: event.payload.workspaceRoot }
               : {}),
+            ...(event.payload.location !== undefined ? { location: event.payload.location } : {}),
             ...(event.payload.defaultModel !== undefined
               ? { defaultModel: event.payload.defaultModel }
               : {}),
@@ -837,6 +840,7 @@ const makeOrchestrationProjectionPipeline = Effect.gen(function* () {
               checkpointRef: null,
               checkpointStatus: null,
               checkpointFiles: [],
+              checkpointDiff: null,
             });
           }
 
@@ -886,6 +890,7 @@ const makeOrchestrationProjectionPipeline = Effect.gen(function* () {
             checkpointRef: null,
             checkpointStatus: null,
             checkpointFiles: [],
+            checkpointDiff: null,
           });
           return;
         }
@@ -921,6 +926,7 @@ const makeOrchestrationProjectionPipeline = Effect.gen(function* () {
             checkpointRef: null,
             checkpointStatus: null,
             checkpointFiles: [],
+            checkpointDiff: null,
           });
           return;
         }
@@ -946,6 +952,7 @@ const makeOrchestrationProjectionPipeline = Effect.gen(function* () {
               checkpointRef: event.payload.checkpointRef,
               checkpointStatus: event.payload.status,
               checkpointFiles: event.payload.files,
+              checkpointDiff: event.payload.diff ?? null,
               startedAt: existingTurn.value.startedAt ?? event.payload.completedAt,
               requestedAt: existingTurn.value.requestedAt ?? event.payload.completedAt,
               completedAt: event.payload.completedAt,
@@ -965,6 +972,7 @@ const makeOrchestrationProjectionPipeline = Effect.gen(function* () {
             checkpointRef: event.payload.checkpointRef,
             checkpointStatus: event.payload.status,
             checkpointFiles: event.payload.files,
+            checkpointDiff: event.payload.diff ?? null,
           });
           return;
         }

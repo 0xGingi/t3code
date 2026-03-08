@@ -29,6 +29,7 @@ import {
   normalizeModelSlug,
   resolveModelSlugForProvider,
 } from "@t3tools/shared/model";
+import { workspaceHandleForProject, workspaceHandleForThread } from "../lib/workspaceLocation";
 import {
   memo,
   useCallback,
@@ -1169,7 +1170,9 @@ export default function ChatView({ threadId }: ChatViewProps) {
     latestTurnSettled,
     timelineEntries,
   ]);
-  const gitCwd = activeThread?.worktreePath ?? activeProject?.cwd ?? null;
+  const activeProjectWorkspaceHandle = activeProject ? workspaceHandleForProject(activeProject) : null;
+  const gitCwd =
+    activeProject && activeThread ? workspaceHandleForThread(activeProject, activeThread) : null;
   const composerTriggerKind = composerTrigger?.kind ?? null;
   const pathTriggerQuery = composerTrigger?.kind === "path" ? composerTrigger.query : "";
   const isPathTrigger = composerTriggerKind === "path";
@@ -1438,7 +1441,7 @@ export default function ChatView({ threadId }: ChatViewProps) {
           return { ...current, [activeProject.id]: script.id };
         });
       }
-      const targetCwd = options?.cwd ?? gitCwd ?? activeProject.cwd;
+      const targetCwd = options?.cwd ?? gitCwd ?? activeProjectWorkspaceHandle ?? activeProject.cwd;
       const baseTerminalId =
         terminalState.activeTerminalId ||
         terminalState.terminalIds[0] ||
@@ -1498,6 +1501,7 @@ export default function ChatView({ threadId }: ChatViewProps) {
     },
     [
       activeProject,
+      activeProjectWorkspaceHandle,
       activeThread,
       activeThreadId,
       gitCwd,
@@ -2507,7 +2511,7 @@ export default function ChatView({ threadId }: ChatViewProps) {
         beginSendPhase("preparing-worktree");
         const newBranch = buildTemporaryWorktreeBranchName();
         const result = await createWorktreeMutation.mutateAsync({
-          cwd: activeProject.cwd,
+          cwd: activeProjectWorkspaceHandle ?? activeProject.cwd,
           branch: baseBranchForWorktree,
           newBranch,
         });
@@ -3391,7 +3395,7 @@ export default function ChatView({ threadId }: ChatViewProps) {
           activeThreadTitle={activeThread.title}
           activeProjectName={activeProject?.name}
           isGitRepo={isGitRepo}
-          openInCwd={activeThread.worktreePath ?? activeProject?.cwd ?? null}
+          openInCwd={gitCwd ?? activeProjectWorkspaceHandle}
           activeProjectScripts={activeProject?.scripts}
           preferredScriptId={
             activeProject ? (lastInvokedScriptByProjectId[activeProject.id] ?? null) : null
@@ -3452,6 +3456,7 @@ export default function ChatView({ threadId }: ChatViewProps) {
           markdownCwd={gitCwd ?? undefined}
           resolvedTheme={resolvedTheme}
           workspaceRoot={activeProject?.cwd ?? undefined}
+          workspaceHandle={activeProjectWorkspaceHandle ?? undefined}
         />
       </div>
 
@@ -3876,7 +3881,7 @@ export default function ChatView({ threadId }: ChatViewProps) {
           <ThreadTerminalDrawer
             key={activeThread.id}
             threadId={activeThread.id}
-            cwd={gitCwd ?? activeProject.cwd}
+            cwd={gitCwd ?? activeProjectWorkspaceHandle ?? activeProject.cwd}
             runtimeEnv={threadTerminalRuntimeEnv}
             height={terminalState.terminalHeight}
             terminalIds={terminalState.terminalIds}
@@ -4515,10 +4520,12 @@ const ProposedPlanCard = memo(function ProposedPlanCard({
   planMarkdown,
   cwd,
   workspaceRoot,
+  workspaceHandle,
 }: {
   planMarkdown: string;
   cwd: string | undefined;
   workspaceRoot: string | undefined;
+  workspaceHandle: string | undefined;
 }) {
   const [expanded, setExpanded] = useState(false);
   const [isSaveDialogOpen, setIsSaveDialogOpen] = useState(false);
@@ -4551,7 +4558,7 @@ const ProposedPlanCard = memo(function ProposedPlanCard({
   const handleSaveToWorkspace = () => {
     const api = readNativeApi();
     const relativePath = savePath.trim();
-    if (!api || !workspaceRoot) {
+    if (!api || !workspaceRoot || !workspaceHandle) {
       return;
     }
     if (!relativePath) {
@@ -4565,7 +4572,7 @@ const ProposedPlanCard = memo(function ProposedPlanCard({
     setIsSavingToWorkspace(true);
     void api.projects
       .writeFile({
-        cwd: workspaceRoot,
+        cwd: workspaceHandle,
         relativePath,
         contents: saveContents,
       })
@@ -4703,6 +4710,7 @@ interface MessagesTimelineProps {
   markdownCwd: string | undefined;
   resolvedTheme: "light" | "dark";
   workspaceRoot: string | undefined;
+  workspaceHandle: string | undefined;
 }
 
 type TimelineEntry = ReturnType<typeof deriveTimelineEntries>[number];
@@ -4757,6 +4765,7 @@ const MessagesTimeline = memo(function MessagesTimeline({
   markdownCwd,
   resolvedTheme,
   workspaceRoot,
+  workspaceHandle,
 }: MessagesTimelineProps) {
   const timelineRootRef = useRef<HTMLDivElement | null>(null);
   const [timelineWidthPx, setTimelineWidthPx] = useState<number | null>(null);
@@ -5212,6 +5221,7 @@ const MessagesTimeline = memo(function MessagesTimeline({
             planMarkdown={row.proposedPlan.planMarkdown}
             cwd={markdownCwd}
             workspaceRoot={workspaceRoot}
+            workspaceHandle={workspaceHandle}
           />
         </div>
       )}

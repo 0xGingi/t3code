@@ -11,6 +11,7 @@
  */
 import { randomUUID } from "node:crypto";
 
+import { decodeWorkspaceHandle } from "@t3tools/shared/workspace";
 import { Effect, Layer, FileSystem, Path } from "effect";
 
 import { CheckpointInvariantError } from "../Errors.ts";
@@ -19,6 +20,7 @@ import { GitServiceLive } from "../../git/Layers/GitService.ts";
 import { GitService } from "../../git/Services/GitService.ts";
 import { CheckpointStore, type CheckpointStoreShape } from "../Services/CheckpointStore.ts";
 import { CheckpointRef } from "@t3tools/contracts";
+import { quotePosixShellArg, runSshCommand } from "../../ssh.ts";
 
 const makeCheckpointStore = Effect.gen(function* () {
   const fs = yield* FileSystem.FileSystem;
@@ -90,6 +92,50 @@ const makeCheckpointStore = Effect.gen(function* () {
   const captureCheckpoint: CheckpointStoreShape["captureCheckpoint"] = (input) =>
     Effect.gen(function* () {
       const operation = "CheckpointStore.captureCheckpoint";
+      const workspaceTarget = decodeWorkspaceHandle(input.cwd);
+
+      if (workspaceTarget?.kind === "ssh") {
+        const message = `t3 checkpoint ref=${input.checkpointRef}`;
+        const remoteIndexName = `index-${randomUUID()}`;
+
+        yield* Effect.tryPromise({
+          try: () =>
+            runSshCommand({
+              hostAlias: workspaceTarget.hostAlias,
+              stateDir: process.env.T3CODE_STATE_DIR ?? process.cwd(),
+              script: [
+                "set -e",
+                `cd ${quotePosixShellArg(workspaceTarget.cwd)}`,
+                'temp_dir=$(mktemp -d "${TMPDIR:-/tmp}/t3-fs-checkpoint-XXXXXX")',
+                `trap 'rm -rf "$temp_dir"' EXIT`,
+                `export GIT_INDEX_FILE="$temp_dir/${remoteIndexName}"`,
+                `export GIT_AUTHOR_NAME=${quotePosixShellArg("T3 Code")}`,
+                `export GIT_AUTHOR_EMAIL=${quotePosixShellArg("t3code@users.noreply.github.com")}`,
+                `export GIT_COMMITTER_NAME=${quotePosixShellArg("T3 Code")}`,
+                `export GIT_COMMITTER_EMAIL=${quotePosixShellArg("t3code@users.noreply.github.com")}`,
+                "if git rev-parse --verify HEAD >/dev/null 2>&1; then",
+                "  git read-tree HEAD",
+                "fi",
+                "git add -A -- .",
+                'tree_oid=$(git write-tree)',
+                'if [ -z "$tree_oid" ]; then echo "git write-tree returned an empty tree oid." >&2; exit 1; fi',
+                `commit_oid=$(git commit-tree "$tree_oid" -m ${quotePosixShellArg(message)})`,
+                'if [ -z "$commit_oid" ]; then echo "git commit-tree returned an empty commit oid." >&2; exit 1; fi',
+                `git update-ref ${quotePosixShellArg(input.checkpointRef)} "$commit_oid"`,
+              ].join("\n"),
+            }),
+          catch: (cause) =>
+            new GitCommandError({
+              operation,
+              command: "git checkpoint capture",
+              cwd: input.cwd,
+              detail:
+                cause instanceof Error ? cause.message : "Failed to capture remote checkpoint.",
+              ...(cause !== undefined ? { cause } : {}),
+            }),
+        });
+        return;
+      }
 
       yield* Effect.acquireUseRelease(
         fs.makeTempDirectory({ prefix: "t3-fs-checkpoint-" }),

@@ -1,8 +1,13 @@
+import fs from "node:fs/promises";
+
 import { Effect, Layer } from "effect";
+import { decodeWorkspaceHandle } from "@t3tools/shared/workspace";
 
 import { runProcess } from "../../processRunner";
+import { ServerConfig } from "../../config.ts";
 import { GitHubCliError } from "../Errors.ts";
 import { GitHubCli, type GitHubCliShape } from "../Services/GitHubCli.ts";
+import { buildRemoteExecScript, quotePosixShellArg, runSshCommand } from "../../ssh.ts";
 
 const DEFAULT_TIMEOUT_MS = 30_000;
 
@@ -99,14 +104,31 @@ function parseOpenPullRequests(raw: string): ReadonlyArray<{
   return result;
 }
 
-const makeGitHubCli = Effect.sync(() => {
+const makeGitHubCli = Effect.gen(function* () {
+  const serverConfig = yield* ServerConfig;
+
   const execute: GitHubCliShape["execute"] = (input) =>
     Effect.tryPromise({
-      try: () =>
-        runProcess("gh", input.args, {
+      try: () => {
+        const workspaceTarget = decodeWorkspaceHandle(input.cwd);
+        if (workspaceTarget?.kind === "ssh") {
+          return runSshCommand({
+            hostAlias: workspaceTarget.hostAlias,
+            stateDir: serverConfig.stateDir,
+            script: buildRemoteExecScript({
+              cwd: workspaceTarget.cwd,
+              command: "gh",
+              args: input.args,
+            }),
+            timeoutMs: input.timeoutMs ?? DEFAULT_TIMEOUT_MS,
+          });
+        }
+
+        return runProcess("gh", input.args, {
           cwd: input.cwd,
           timeoutMs: input.timeoutMs ?? DEFAULT_TIMEOUT_MS,
-        }),
+        });
+      },
       catch: (error) => normalizeGitHubCliError("execute", error),
     });
 
@@ -145,21 +167,57 @@ const makeGitHubCli = Effect.sync(() => {
         ),
       ),
     createPullRequest: (input) =>
-      execute({
-        cwd: input.cwd,
-        args: [
-          "pr",
-          "create",
-          "--base",
-          input.baseBranch,
-          "--head",
-          input.headBranch,
-          "--title",
-          input.title,
-          "--body-file",
-          input.bodyFile,
-        ],
-      }).pipe(Effect.asVoid),
+      Effect.tryPromise({
+        try: async () => {
+          const workspaceTarget = decodeWorkspaceHandle(input.cwd);
+          if (workspaceTarget?.kind === "ssh") {
+            const body = await fs.readFile(input.bodyFile, "utf8");
+            await runSshCommand({
+              hostAlias: workspaceTarget.hostAlias,
+              stateDir: serverConfig.stateDir,
+              cwd: undefined,
+              stdin: body,
+              script: [
+                `cd ${quotePosixShellArg(workspaceTarget.cwd)}`,
+                `tmp_file=$(mktemp)`,
+                `cat > "$tmp_file"`,
+                [
+                  "gh",
+                  "pr",
+                  "create",
+                  "--base",
+                  quotePosixShellArg(input.baseBranch),
+                  "--head",
+                  quotePosixShellArg(input.headBranch),
+                  "--title",
+                  quotePosixShellArg(input.title),
+                  "--body-file",
+                  `"$tmp_file"`,
+                ].join(" "),
+                `rm -f "$tmp_file"`,
+              ].join(" && "),
+            });
+            return;
+          }
+
+          await runProcess("gh", [
+            "pr",
+            "create",
+            "--base",
+            input.baseBranch,
+            "--head",
+            input.headBranch,
+            "--title",
+            input.title,
+            "--body-file",
+            input.bodyFile,
+          ], {
+            cwd: input.cwd,
+            timeoutMs: DEFAULT_TIMEOUT_MS,
+          });
+        },
+        catch: (error) => normalizeGitHubCliError("execute", error),
+      }),
     getDefaultBranch: (input) =>
       execute({
         cwd: input.cwd,

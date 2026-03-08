@@ -11,11 +11,14 @@ import {
   ProjectionProjectRepository,
   type ProjectionProjectRepositoryShape,
 } from "../Services/ProjectionProjects.ts";
-import { ProjectScript } from "@t3tools/contracts";
+import { ProjectLocation, ProjectScript } from "@t3tools/contracts";
 
 // Makes sure that the scripts are parsed from the JSON string the DB returns
 const ProjectionProjectDbRowSchema = ProjectionProject.mapFields(
-  Struct.assign({ scripts: Schema.fromJsonString(Schema.Array(ProjectScript)) }),
+  Struct.assign({
+    location: Schema.fromJsonString(ProjectLocation),
+    scripts: Schema.fromJsonString(Schema.Array(ProjectScript)),
+  }),
 );
 
 function toPersistenceSqlOrDecodeError(sqlOperation: string, decodeOperation: string) {
@@ -36,6 +39,7 @@ const makeProjectionProjectRepository = Effect.gen(function* () {
               project_id,
               title,
               workspace_root,
+              location_json,
               default_model,
               scripts_json,
               created_at,
@@ -46,6 +50,7 @@ const makeProjectionProjectRepository = Effect.gen(function* () {
               ${row.projectId},
               ${row.title},
               ${row.workspaceRoot},
+              ${row.location},
               ${row.defaultModel},
               ${row.scripts},
               ${row.createdAt},
@@ -56,6 +61,7 @@ const makeProjectionProjectRepository = Effect.gen(function* () {
             DO UPDATE SET
               title = excluded.title,
               workspace_root = excluded.workspace_root,
+              location_json = excluded.location_json,
               default_model = excluded.default_model,
               scripts_json = excluded.scripts_json,
               created_at = excluded.created_at,
@@ -73,6 +79,10 @@ const makeProjectionProjectRepository = Effect.gen(function* () {
           project_id AS "projectId",
           title,
           workspace_root AS "workspaceRoot",
+          COALESCE(
+            location_json,
+            json_object('kind', 'local', 'rootPath', workspace_root)
+          ) AS "location",
           default_model AS "defaultModel",
           scripts_json AS "scripts",
           created_at AS "createdAt",
@@ -92,6 +102,10 @@ const makeProjectionProjectRepository = Effect.gen(function* () {
           project_id AS "projectId",
           title,
           workspace_root AS "workspaceRoot",
+          COALESCE(
+            location_json,
+            json_object('kind', 'local', 'rootPath', workspace_root)
+          ) AS "location",
           default_model AS "defaultModel",
           scripts_json AS "scripts",
           created_at AS "createdAt",

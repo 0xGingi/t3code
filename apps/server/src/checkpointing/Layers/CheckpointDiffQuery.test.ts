@@ -20,8 +20,11 @@ function makeSnapshot(input: {
   readonly threadId: ThreadId;
   readonly workspaceRoot: string;
   readonly worktreePath: string | null;
-  readonly checkpointTurnCount: number;
-  readonly checkpointRef: CheckpointRef;
+  readonly checkpoints: ReadonlyArray<{
+    readonly checkpointTurnCount: number;
+    readonly checkpointRef: CheckpointRef;
+    readonly diff?: string;
+  }>;
 }): OrchestrationReadModel {
   return {
     snapshotSequence: 0,
@@ -31,6 +34,7 @@ function makeSnapshot(input: {
         id: input.projectId,
         title: "Project",
         workspaceRoot: input.workspaceRoot,
+        location: { kind: "local", rootPath: input.workspaceRoot },
         defaultModel: null,
         scripts: [],
         createdAt: "2026-01-01T00:00:00.000Z",
@@ -62,17 +66,16 @@ function makeSnapshot(input: {
         messages: [],
         activities: [],
         proposedPlans: [],
-        checkpoints: [
-          {
-            turnId: TurnId.makeUnsafe("turn-1"),
-            checkpointTurnCount: input.checkpointTurnCount,
-            checkpointRef: input.checkpointRef,
-            status: "ready",
-            files: [],
-            assistantMessageId: null,
-            completedAt: "2026-01-01T00:00:00.000Z",
-          },
-        ],
+        checkpoints: input.checkpoints.map((checkpoint, index) => ({
+          turnId: TurnId.makeUnsafe(`turn-${index + 1}`),
+          checkpointTurnCount: checkpoint.checkpointTurnCount,
+          checkpointRef: checkpoint.checkpointRef,
+          status: "ready" as const,
+          files: [],
+          ...(checkpoint.diff !== undefined ? { diff: checkpoint.diff } : {}),
+          assistantMessageId: null,
+          completedAt: "2026-01-01T00:00:00.000Z",
+        })),
         session: null,
       },
     ],
@@ -96,8 +99,12 @@ describe("CheckpointDiffQueryLive", () => {
       threadId,
       workspaceRoot: "/tmp/workspace",
       worktreePath: null,
-      checkpointTurnCount: 1,
-      checkpointRef: toCheckpointRef,
+      checkpoints: [
+        {
+          checkpointTurnCount: 1,
+          checkpointRef: toCheckpointRef,
+        },
+      ],
     });
 
     const checkpointStore: CheckpointStoreShape = {
@@ -193,5 +200,122 @@ describe("CheckpointDiffQueryLive", () => {
         }).pipe(Effect.provide(layer)),
       ),
     ).rejects.toThrow("Thread 'thread-missing' not found.");
+  });
+
+  it("falls back to concatenated projected diffs for full-thread diffs when checkpoint refs are unavailable", async () => {
+    const projectId = ProjectId.makeUnsafe("project-1");
+    const threadId = ThreadId.makeUnsafe("thread-1");
+
+    const snapshot = makeSnapshot({
+      projectId,
+      threadId,
+      workspaceRoot: "/tmp/workspace",
+      worktreePath: null,
+      checkpoints: [
+        {
+          checkpointTurnCount: 1,
+          checkpointRef: CheckpointRef.makeUnsafe("provider-diff:turn-1"),
+          diff: "diff --git a/README.md b/README.md\n+turn1\n",
+        },
+        {
+          checkpointTurnCount: 2,
+          checkpointRef: CheckpointRef.makeUnsafe("provider-diff:turn-2"),
+          diff: "diff --git a/README.md b/README.md\n+turn2\n",
+        },
+      ],
+    });
+
+    const checkpointStore: CheckpointStoreShape = {
+      isGitRepository: () => Effect.succeed(true),
+      captureCheckpoint: () => Effect.void,
+      hasCheckpointRef: () => Effect.succeed(false),
+      restoreCheckpoint: () => Effect.succeed(true),
+      diffCheckpoints: () => Effect.succeed(""),
+      deleteCheckpointRefs: () => Effect.void,
+    };
+
+    const layer = CheckpointDiffQueryLive.pipe(
+      Layer.provideMerge(Layer.succeed(CheckpointStore, checkpointStore)),
+      Layer.provideMerge(
+        Layer.succeed(ProjectionSnapshotQuery, {
+          getSnapshot: () => Effect.succeed(snapshot),
+        }),
+      ),
+    );
+
+    const result = await Effect.runPromise(
+      Effect.gen(function* () {
+        const query = yield* CheckpointDiffQuery;
+        return yield* query.getFullThreadDiff({
+          threadId,
+          toTurnCount: 2,
+        });
+      }).pipe(Effect.provide(layer)),
+    );
+
+    expect(result).toEqual({
+      threadId,
+      fromTurnCount: 0,
+      toTurnCount: 2,
+      diff: "diff --git a/README.md b/README.md\n+turn1\n\ndiff --git a/README.md b/README.md\n+turn2\n",
+    });
+  });
+
+  it("uses available projected diffs for full-thread diffs when earlier projected diffs are missing", async () => {
+    const projectId = ProjectId.makeUnsafe("project-1");
+    const threadId = ThreadId.makeUnsafe("thread-1");
+
+    const snapshot = makeSnapshot({
+      projectId,
+      threadId,
+      workspaceRoot: "/tmp/workspace",
+      worktreePath: null,
+      checkpoints: [
+        {
+          checkpointTurnCount: 1,
+          checkpointRef: CheckpointRef.makeUnsafe("provider-diff:turn-1"),
+        },
+        {
+          checkpointTurnCount: 2,
+          checkpointRef: CheckpointRef.makeUnsafe("provider-diff:turn-2"),
+          diff: "diff --git a/README.md b/README.md\n+turn2\n",
+        },
+      ],
+    });
+
+    const checkpointStore: CheckpointStoreShape = {
+      isGitRepository: () => Effect.succeed(true),
+      captureCheckpoint: () => Effect.void,
+      hasCheckpointRef: () => Effect.succeed(false),
+      restoreCheckpoint: () => Effect.succeed(true),
+      diffCheckpoints: () => Effect.succeed(""),
+      deleteCheckpointRefs: () => Effect.void,
+    };
+
+    const layer = CheckpointDiffQueryLive.pipe(
+      Layer.provideMerge(Layer.succeed(CheckpointStore, checkpointStore)),
+      Layer.provideMerge(
+        Layer.succeed(ProjectionSnapshotQuery, {
+          getSnapshot: () => Effect.succeed(snapshot),
+        }),
+      ),
+    );
+
+    const result = await Effect.runPromise(
+      Effect.gen(function* () {
+        const query = yield* CheckpointDiffQuery;
+        return yield* query.getFullThreadDiff({
+          threadId,
+          toTurnCount: 2,
+        });
+      }).pipe(Effect.provide(layer)),
+    );
+
+    expect(result).toEqual({
+      threadId,
+      fromTurnCount: 0,
+      toTurnCount: 2,
+      diff: "diff --git a/README.md b/README.md\n+turn2\n",
+    });
   });
 });

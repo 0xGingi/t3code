@@ -11,6 +11,7 @@ import { accessSync, constants, statSync } from "node:fs";
 import { extname, join } from "node:path";
 
 import { EDITORS, type EditorId } from "@t3tools/contracts";
+import { decodeWorkspaceHandle } from "@t3tools/shared/workspace";
 import { ServiceMap, Schema, Effect, Layer } from "effect";
 
 // ==============================
@@ -208,6 +209,35 @@ export const resolveEditorLaunch = Effect.fnUntraced(function* (
   const editorDef = EDITORS.find((editor) => editor.id === input.editor);
   if (!editorDef) {
     return yield* new OpenError({ message: `Unknown editor: ${input.editor}` });
+  }
+
+  const workspaceTarget = decodeWorkspaceHandle(input.cwd);
+  if (workspaceTarget?.kind === "ssh") {
+    if (input.editor === "file-manager" || input.editor === "zed") {
+      return yield* new OpenError({
+        message: `${input.editor} does not support SSH-hosted workspaces in T3 Code yet.`,
+      });
+    }
+
+    const remoteArgs =
+      input.editor === "vscode" || input.editor === "cursor"
+        ? ["--remote", `ssh-remote+${workspaceTarget.hostAlias}`]
+        : null;
+    if (!remoteArgs || !editorDef.command) {
+      return yield* new OpenError({
+        message: `Unsupported editor for SSH-hosted workspace: ${input.editor}`,
+      });
+    }
+
+    return shouldUseGotoFlag(editorDef.id, workspaceTarget.cwd)
+      ? {
+          command: editorDef.command,
+          args: [...remoteArgs, "--goto", workspaceTarget.cwd],
+        }
+      : {
+          command: editorDef.command,
+          args: [...remoteArgs, workspaceTarget.cwd],
+        };
   }
 
   if (editorDef.command) {

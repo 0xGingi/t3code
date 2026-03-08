@@ -24,6 +24,7 @@ import {
   ThreadSessionSetPayload,
   ThreadTurnDiffCompletedPayload,
 } from "./Schemas.ts";
+import { localProjectLocation } from "@t3tools/shared/workspace";
 
 type ThreadPatch = Partial<Omit<OrchestrationThread, "id" | "projectId">>;
 const MAX_THREAD_MESSAGES = 2_000;
@@ -181,6 +182,7 @@ export function projectEvent(
             id: payload.projectId,
             title: payload.title,
             workspaceRoot: payload.workspaceRoot,
+            location: payload.location ?? localProjectLocation(payload.workspaceRoot),
             defaultModel: payload.defaultModel,
             scripts: payload.scripts,
             createdAt: payload.createdAt,
@@ -211,6 +213,7 @@ export function projectEvent(
                   ...(payload.workspaceRoot !== undefined
                     ? { workspaceRoot: payload.workspaceRoot }
                     : {}),
+                  ...(payload.location !== undefined ? { location: payload.location } : {}),
                   ...(payload.defaultModel !== undefined
                     ? { defaultModel: payload.defaultModel }
                     : {}),
@@ -498,6 +501,7 @@ export function projectEvent(
             checkpointRef: payload.checkpointRef,
             status: payload.status,
             files: payload.files,
+            ...(payload.diff !== undefined ? { diff: payload.diff } : {}),
             assistantMessageId: payload.assistantMessageId,
             completedAt: payload.completedAt,
           },

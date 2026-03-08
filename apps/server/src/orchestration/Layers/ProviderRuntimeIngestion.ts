@@ -14,7 +14,7 @@ import { Cache, Cause, Duration, Effect, Layer, Option, Queue, Ref, Stream } fro
 
 import { ProviderService } from "../../provider/Services/ProviderService.ts";
 import { resolveThreadWorkspaceCwd } from "../../checkpointing/Utils.ts";
-import { isGitRepository } from "../../git/isRepo.ts";
+import { CheckpointStore } from "../../checkpointing/Services/CheckpointStore.ts";
 import { OrchestrationEngineService } from "../Services/OrchestrationEngine.ts";
 import {
   ProviderRuntimeIngestionService,
@@ -486,6 +486,7 @@ function runtimeEventToActivities(
 const make = Effect.gen(function* () {
   const orchestrationEngine = yield* OrchestrationEngineService;
   const providerService = yield* ProviderService;
+  const checkpointStore = yield* CheckpointStore;
 
   const assistantDeliveryModeRef = yield* Ref.make<AssistantDeliveryMode>(
     DEFAULT_ASSISTANT_DELIVERY_MODE,
@@ -522,7 +523,7 @@ const make = Effect.gen(function* () {
     if (!workspaceCwd) {
       return false;
     }
-    return isGitRepository(workspaceCwd);
+    return yield* checkpointStore.isGitRepository(workspaceCwd);
   });
 
   const rememberAssistantMessageId = (
@@ -1072,6 +1073,9 @@ const make = Effect.gen(function* () {
             checkpointRef: CheckpointRef.makeUnsafe(`provider-diff:${event.eventId}`),
             status: "missing",
             files: [],
+            ...(event.payload.unifiedDiff.trim().length > 0
+              ? { diff: event.payload.unifiedDiff }
+              : {}),
             assistantMessageId,
             checkpointTurnCount: thread.checkpoints.length + 1,
             createdAt: now,

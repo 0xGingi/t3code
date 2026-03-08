@@ -192,6 +192,7 @@ function createSnapshotForTargetUser(options: {
         id: PROJECT_ID,
         title: "Project",
         workspaceRoot: "/repo/project",
+        location: { kind: "local", rootPath: "/repo/project" },
         defaultModel: "gpt-5",
         scripts: [],
         createdAt: NOW_ISO,

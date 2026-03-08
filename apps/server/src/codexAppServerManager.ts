@@ -20,6 +20,7 @@ import {
   ProviderInteractionMode,
 } from "@t3tools/contracts";
 import { normalizeModelSlug } from "@t3tools/shared/model";
+import { decodeWorkspaceHandle } from "@t3tools/shared/workspace";
 import { Effect, ServiceMap } from "effect";
 
 import {
@@ -27,6 +28,8 @@ import {
   isCodexCliVersionSupported,
   parseCodexCliVersion,
 } from "./provider/codexCliVersion";
+import { buildRemoteExecScript, buildRemoteShellCommand, buildSshArgs } from "./ssh";
+import { ensureRemoteCodexAvailable } from "./remoteCodex";
 
 type PendingRequestKey = string;
 
@@ -145,6 +148,9 @@ export interface CodexThreadSnapshot {
 }
 
 const CODEX_VERSION_CHECK_TIMEOUT_MS = 4_000;
+const CODEX_RPC_REQUEST_TIMEOUT_MS = 20_000;
+const CODEX_REMOTE_RPC_REQUEST_TIMEOUT_MS = 60_000;
+const CODEX_REMOTE_INITIALIZE_TIMEOUT_MS = 90_000;
 
 const ANSI_ESCAPE_CHAR = String.fromCharCode(27);
 const ANSI_ESCAPE_REGEX = new RegExp(`${ANSI_ESCAPE_CHAR}\\[[0-9;]*m`, "g");
@@ -153,6 +159,8 @@ const CODEX_STDERR_LOG_REGEX =
 const BENIGN_ERROR_LOG_SNIPPETS = [
   "state db missing rollout path for thread",
   "state db record_discrepancy: find_thread_path_by_id_str_in_subdir, falling_back",
+  "rmcp::transport::worker: worker quit with fatal: Transport channel closed, when Auth(TokenRefreshFailed(",
+  'Auth(TokenRefreshFailed("Failed to parse server response"))',
 ];
 const RECOVERABLE_THREAD_RESUME_ERROR_SNIPPETS = [
   "not found",
@@ -543,20 +551,63 @@ export class CodexAppServerManager extends EventEmitter<CodexAppServerManagerEve
       const codexOptions = readCodexProviderOptions(input);
       const codexBinaryPath = codexOptions.binaryPath ?? "codex";
       const codexHomePath = codexOptions.homePath;
+      const workspaceTarget = decodeWorkspaceHandle(resolvedCwd);
+      if (workspaceTarget?.kind === "ssh" && codexBinaryPath === "codex") {
+        await ensureRemoteCodexAvailable({
+          hostAlias: workspaceTarget.hostAlias,
+          stateDir: process.env.T3CODE_STATE_DIR ?? process.cwd(),
+          rootPath: workspaceTarget.cwd,
+          binaryPath: codexBinaryPath,
+          ...(codexHomePath ? { homePath: codexHomePath } : {}),
+          checkAuthStatus: false,
+        });
+      }
       this.assertSupportedCodexCliVersion({
         binaryPath: codexBinaryPath,
         cwd: resolvedCwd,
         ...(codexHomePath ? { homePath: codexHomePath } : {}),
       });
-      const child = spawn(codexBinaryPath, ["app-server"], {
-        cwd: resolvedCwd,
-        env: {
-          ...process.env,
-          ...(codexHomePath ? { CODEX_HOME: codexHomePath } : {}),
-        },
-        stdio: ["pipe", "pipe", "pipe"],
-        shell: process.platform === "win32",
-      });
+      const rpcTimeoutMs =
+        workspaceTarget?.kind === "ssh"
+          ? CODEX_REMOTE_RPC_REQUEST_TIMEOUT_MS
+          : CODEX_RPC_REQUEST_TIMEOUT_MS;
+      const initializeTimeoutMs =
+        workspaceTarget?.kind === "ssh"
+          ? CODEX_REMOTE_INITIALIZE_TIMEOUT_MS
+          : CODEX_RPC_REQUEST_TIMEOUT_MS;
+      const child =
+        workspaceTarget?.kind === "ssh"
+          ? spawn(
+              "ssh",
+              [
+                ...buildSshArgs({
+                  hostAlias: workspaceTarget.hostAlias,
+                  stateDir: process.env.T3CODE_STATE_DIR ?? process.cwd(),
+                  remoteCommand: buildRemoteShellCommand(
+                    buildRemoteExecScript({
+                      cwd: workspaceTarget.cwd,
+                      command: codexBinaryPath,
+                      args: ["app-server"],
+                      ...(codexHomePath ? { env: { CODEX_HOME: codexHomePath } } : {}),
+                    }),
+                  ),
+                }),
+              ],
+              {
+                env: process.env,
+                stdio: ["pipe", "pipe", "pipe"],
+                shell: process.platform === "win32",
+              },
+            )
+          : spawn(codexBinaryPath, ["app-server"], {
+              cwd: resolvedCwd,
+              env: {
+                ...process.env,
+                ...(codexHomePath ? { CODEX_HOME: codexHomePath } : {}),
+              },
+              stdio: ["pipe", "pipe", "pipe"],
+              shell: process.platform === "win32",
+            });
       const output = readline.createInterface({ input: child.stdout });
 
       context = {
@@ -580,17 +631,27 @@ export class CodexAppServerManager extends EventEmitter<CodexAppServerManagerEve
 
       this.emitLifecycleEvent(context, "session/connecting", "Starting codex app-server");
 
-      await this.sendRequest(context, "initialize", buildCodexInitializeParams());
+      await this.sendRequest(
+        context,
+        "initialize",
+        buildCodexInitializeParams(),
+        initializeTimeoutMs,
+      );
 
       this.writeMessage(context, { method: "initialized" });
       try {
-        const modelListResponse = await this.sendRequest(context, "model/list", {});
+        const modelListResponse = await this.sendRequest(context, "model/list", {}, rpcTimeoutMs);
         console.log("codex model/list response", modelListResponse);
       } catch (error) {
         console.log("codex model/list failed", error);
       }
       try {
-        const accountReadResponse = await this.sendRequest(context, "account/read", {});
+        const accountReadResponse = await this.sendRequest(
+          context,
+          "account/read",
+          {},
+          rpcTimeoutMs,
+        );
         console.log("codex account/read response", accountReadResponse);
         context.account = readCodexAccountSnapshot(accountReadResponse);
         console.log("codex subscription status", {
@@ -609,7 +670,7 @@ export class CodexAppServerManager extends EventEmitter<CodexAppServerManagerEve
       const sessionOverrides = {
         model: normalizedModel ?? null,
         ...(input.serviceTier !== undefined ? { serviceTier: input.serviceTier } : {}),
-        cwd: input.cwd ?? null,
+        cwd: workspaceTarget?.kind === "ssh" ? workspaceTarget.cwd : (input.cwd ?? null),
         ...mapCodexRuntimeMode(input.runtimeMode ?? "full-access"),
       };
 
@@ -641,7 +702,7 @@ export class CodexAppServerManager extends EventEmitter<CodexAppServerManagerEve
           threadOpenResponse = await this.sendRequest(context, "thread/resume", {
             ...sessionOverrides,
             threadId: resumeThreadId,
-          });
+          }, rpcTimeoutMs);
         } catch (error) {
           if (!isRecoverableThreadResumeError(error)) {
             this.emitErrorEvent(
@@ -672,11 +733,21 @@ export class CodexAppServerManager extends EventEmitter<CodexAppServerManagerEve
             recoverable: true,
             cause: error instanceof Error ? error.message : String(error),
           }).pipe(this.runPromise);
-          threadOpenResponse = await this.sendRequest(context, "thread/start", threadStartParams);
+          threadOpenResponse = await this.sendRequest(
+            context,
+            "thread/start",
+            threadStartParams,
+            rpcTimeoutMs,
+          );
         }
       } else {
         threadOpenMethod = "thread/start";
-        threadOpenResponse = await this.sendRequest(context, "thread/start", threadStartParams);
+        threadOpenResponse = await this.sendRequest(
+          context,
+          "thread/start",
+          threadStartParams,
+          rpcTimeoutMs,
+        );
       }
 
       const threadOpenRecord = this.readObject(threadOpenResponse);
@@ -1526,18 +1597,46 @@ function assertSupportedCodexCliVersion(input: {
   readonly cwd: string;
   readonly homePath?: string;
 }): void {
-  const result = spawnSync(input.binaryPath, ["--version"], {
-    cwd: input.cwd,
-    env: {
-      ...process.env,
-      ...(input.homePath ? { CODEX_HOME: input.homePath } : {}),
-    },
-    encoding: "utf8",
-    shell: process.platform === "win32",
-    stdio: ["ignore", "pipe", "pipe"],
-    timeout: CODEX_VERSION_CHECK_TIMEOUT_MS,
-    maxBuffer: 1024 * 1024,
-  });
+  const workspaceTarget = decodeWorkspaceHandle(input.cwd);
+  const result =
+    workspaceTarget?.kind === "ssh"
+      ? spawnSync(
+          "ssh",
+          [
+            ...buildSshArgs({
+              hostAlias: workspaceTarget.hostAlias,
+              stateDir: process.env.T3CODE_STATE_DIR ?? process.cwd(),
+              remoteCommand: buildRemoteShellCommand(
+                buildRemoteExecScript({
+                  cwd: workspaceTarget.cwd,
+                  command: input.binaryPath,
+                  args: ["--version"],
+                  ...(input.homePath ? { env: { CODEX_HOME: input.homePath } } : {}),
+                }),
+              ),
+            }),
+          ],
+          {
+            env: process.env,
+            encoding: "utf8",
+            shell: process.platform === "win32",
+            stdio: ["ignore", "pipe", "pipe"],
+            timeout: CODEX_VERSION_CHECK_TIMEOUT_MS,
+            maxBuffer: 1024 * 1024,
+          },
+        )
+      : spawnSync(input.binaryPath, ["--version"], {
+          cwd: input.cwd,
+          env: {
+            ...process.env,
+            ...(input.homePath ? { CODEX_HOME: input.homePath } : {}),
+          },
+          encoding: "utf8",
+          shell: process.platform === "win32",
+          stdio: ["ignore", "pipe", "pipe"],
+          timeout: CODEX_VERSION_CHECK_TIMEOUT_MS,
+          maxBuffer: 1024 * 1024,
+        });
 
   if (result.error) {
     const lower = result.error.message.toLowerCase();

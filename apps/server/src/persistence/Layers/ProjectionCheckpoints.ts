@@ -38,7 +38,8 @@ const makeProjectionCheckpointRepository = Effect.gen(function* () {
           checkpoint_turn_count = NULL,
           checkpoint_ref = NULL,
           checkpoint_status = NULL,
-          checkpoint_files_json = '[]'
+          checkpoint_files_json = '[]',
+          checkpoint_diff_text = NULL
         WHERE thread_id = ${threadId}
           AND checkpoint_turn_count = ${checkpointTurnCount}
       `,
@@ -60,7 +61,8 @@ const makeProjectionCheckpointRepository = Effect.gen(function* () {
           checkpoint_turn_count,
           checkpoint_ref,
           checkpoint_status,
-          checkpoint_files_json
+          checkpoint_files_json,
+          checkpoint_diff_text
         )
         VALUES (
           ${row.threadId},
@@ -74,7 +76,8 @@ const makeProjectionCheckpointRepository = Effect.gen(function* () {
           ${row.checkpointTurnCount},
           ${row.checkpointRef},
           ${row.status},
-          ${row.files}
+          ${row.files},
+          ${row.diff}
         )
         ON CONFLICT (thread_id, turn_id)
         DO UPDATE SET
@@ -84,7 +87,8 @@ const makeProjectionCheckpointRepository = Effect.gen(function* () {
           checkpoint_turn_count = excluded.checkpoint_turn_count,
           checkpoint_ref = excluded.checkpoint_ref,
           checkpoint_status = excluded.checkpoint_status,
-          checkpoint_files_json = excluded.checkpoint_files_json
+          checkpoint_files_json = excluded.checkpoint_files_json,
+          checkpoint_diff_text = excluded.checkpoint_diff_text
       `,
   });
 
@@ -100,6 +104,7 @@ const makeProjectionCheckpointRepository = Effect.gen(function* () {
           checkpoint_ref AS "checkpointRef",
           checkpoint_status AS "status",
           checkpoint_files_json AS "files",
+          checkpoint_diff_text AS "diff",
           assistant_message_id AS "assistantMessageId",
           completed_at AS "completedAt"
         FROM projection_turns
@@ -121,6 +126,7 @@ const makeProjectionCheckpointRepository = Effect.gen(function* () {
           checkpoint_ref AS "checkpointRef",
           checkpoint_status AS "status",
           checkpoint_files_json AS "files",
+          checkpoint_diff_text AS "diff",
           assistant_message_id AS "assistantMessageId",
           completed_at AS "completedAt"
         FROM projection_turns
@@ -138,7 +144,8 @@ const makeProjectionCheckpointRepository = Effect.gen(function* () {
           checkpoint_turn_count = NULL,
           checkpoint_ref = NULL,
           checkpoint_status = NULL,
-          checkpoint_files_json = '[]'
+          checkpoint_files_json = '[]',
+          checkpoint_diff_text = NULL
         WHERE thread_id = ${threadId}
           AND checkpoint_turn_count IS NOT NULL
       `,

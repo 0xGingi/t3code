@@ -3,6 +3,7 @@ import type {
   OrchestrationProposedPlanId,
   OrchestrationSessionStatus,
   OrchestrationThreadActivity,
+  ProjectLocation,
   ProjectScript as ContractProjectScript,
   ThreadId,
   ProjectId,
@@ -69,6 +70,7 @@ export interface TurnDiffSummary {
   completedAt: string;
   status?: string | undefined;
   files: TurnDiffFileChange[];
+  diff?: string | undefined;
   checkpointRef?: CheckpointRef | undefined;
   assistantMessageId?: MessageId | undefined;
   checkpointTurnCount?: number | undefined;
@@ -78,6 +80,7 @@ export interface Project {
   id: ProjectId;
   name: string;
   cwd: string;
+  location: ProjectLocation;
   model: string;
   expanded: boolean;
   scripts: ProjectScript[];

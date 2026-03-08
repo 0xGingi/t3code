@@ -13,11 +13,19 @@ import {
   type TerminalSessionSnapshot,
 } from "@t3tools/contracts";
 import { Effect, Encoding, Layer, Path, Schema } from "effect";
+import { decodeWorkspaceHandle } from "@t3tools/shared/workspace";
 
 import { createLogger } from "../../logger";
 import { PtyAdapter, PtyAdapterShape, type PtyExitEvent, type PtyProcess } from "../Services/PTY";
 import { runProcess } from "../../processRunner";
 import { ServerConfig } from "../../config";
+import {
+  buildRemoteInteractiveShellScript,
+  buildRemoteShellCommand,
+  buildSshArgs,
+  quotePosixShellArg,
+  runSshCommand,
+} from "../../ssh";
 import {
   ShellCandidate,
   TerminalError,
@@ -312,6 +320,7 @@ interface TerminalManagerEvents {
 
 interface TerminalManagerOptions {
   logsDir?: string;
+  stateDir?: string;
   historyLineLimit?: number;
   ptyAdapter: PtyAdapterShape;
   shellResolver?: () => string;
@@ -324,6 +333,7 @@ interface TerminalManagerOptions {
 export class TerminalManagerRuntime extends EventEmitter<TerminalManagerEvents> {
   private readonly sessions = new Map<string, TerminalSessionState>();
   private readonly logsDir: string;
+  private readonly stateDir: string;
   private readonly historyLineLimit: number;
   private readonly ptyAdapter: PtyAdapterShape;
   private readonly shellResolver: () => string;
@@ -344,6 +354,7 @@ export class TerminalManagerRuntime extends EventEmitter<TerminalManagerEvents> 
   constructor(options: TerminalManagerOptions) {
     super();
     this.logsDir = options.logsDir ?? path.resolve(process.cwd(), ".logs", "terminals");
+    this.stateDir = options.stateDir ?? path.resolve(process.cwd(), ".state");
     this.historyLineLimit = options.historyLineLimit ?? DEFAULT_HISTORY_LINE_LIMIT;
     this.ptyAdapter = options.ptyAdapter;
     this.shellResolver = options.shellResolver ?? defaultShellResolver;
@@ -591,17 +602,36 @@ export class TerminalManagerRuntime extends EventEmitter<TerminalManagerEvents> 
     try {
       const shellCandidates = resolveShellCandidates(this.shellResolver);
       const terminalEnv = createTerminalSpawnEnv(process.env, session.runtimeEnv);
+      const workspaceTarget = decodeWorkspaceHandle(session.cwd);
       let lastSpawnError: unknown = null;
 
       const spawnWithCandidate = (candidate: ShellCandidate) =>
         Effect.runPromise(
           this.ptyAdapter.spawn({
-            shell: candidate.shell,
-            ...(candidate.args ? { args: candidate.args } : {}),
-            cwd: session.cwd,
+            shell: workspaceTarget?.kind === "ssh" ? "ssh" : candidate.shell,
+            ...(workspaceTarget?.kind === "ssh"
+              ? {
+                  args: [
+                    ...buildSshArgs({
+                      hostAlias: workspaceTarget.hostAlias,
+                      stateDir: this.stateDir,
+                      allocateTty: true,
+                      remoteCommand: buildRemoteShellCommand(
+                        buildRemoteInteractiveShellScript({
+                          cwd: workspaceTarget.cwd,
+                          env: terminalEnv,
+                        }),
+                      ),
+                    }),
+                  ],
+                }
+              : candidate.args
+                ? { args: candidate.args }
+                : {}),
+            cwd: workspaceTarget?.kind === "ssh" ? process.cwd() : session.cwd,
             cols: session.cols,
             rows: session.rows,
-            env: terminalEnv,
+            env: workspaceTarget?.kind === "ssh" ? process.env : terminalEnv,
           }),
         );
 
@@ -1051,6 +1081,17 @@ export class TerminalManagerRuntime extends EventEmitter<TerminalManagerEvents> 
   }
 
   private async assertValidCwd(cwd: string): Promise<void> {
+    const workspaceTarget = decodeWorkspaceHandle(cwd);
+    if (workspaceTarget?.kind === "ssh") {
+      await runSshCommand({
+        hostAlias: workspaceTarget.hostAlias,
+        stateDir: this.stateDir,
+        timeoutMs: 10_000,
+        script: `test -d ${quotePosixShellArg(workspaceTarget.cwd)}`,
+      });
+      return;
+    }
+
     let stats: fs.Stats;
     try {
       stats = await fs.promises.stat(cwd);
@@ -1176,7 +1217,7 @@ export const TerminalManagerLive = Layer.effect(
 
     const ptyAdapter = yield* PtyAdapter;
     const runtime = yield* Effect.acquireRelease(
-      Effect.sync(() => new TerminalManagerRuntime({ logsDir, ptyAdapter })),
+      Effect.sync(() => new TerminalManagerRuntime({ logsDir, stateDir, ptyAdapter })),
       (r) => Effect.sync(() => r.dispose()),
     );
 

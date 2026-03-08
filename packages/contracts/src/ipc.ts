@@ -17,6 +17,8 @@ import type {
 import type {
   ProjectSearchEntriesInput,
   ProjectSearchEntriesResult,
+  ProjectValidateSshTargetInput,
+  ProjectValidateSshTargetResult,
   ProjectWriteFileInput,
   ProjectWriteFileResult,
 } from "./project";
@@ -110,6 +112,9 @@ export interface NativeApi {
   projects: {
     searchEntries: (input: ProjectSearchEntriesInput) => Promise<ProjectSearchEntriesResult>;
     writeFile: (input: ProjectWriteFileInput) => Promise<ProjectWriteFileResult>;
+    validateSshTarget: (
+      input: ProjectValidateSshTargetInput,
+    ) => Promise<ProjectValidateSshTargetResult>;
   };
   shell: {
     openInEditor: (cwd: string, editor: EditorId) => Promise<void>;

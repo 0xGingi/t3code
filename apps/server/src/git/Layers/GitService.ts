@@ -8,6 +8,7 @@
  */
 import { Effect, Layer, Option, Schema, Stream } from "effect";
 import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process";
+import { decodeWorkspaceHandle } from "@t3tools/shared/workspace";
 import { GitCommandError } from "../Errors.ts";
 import {
   ExecuteGitInput,
@@ -15,6 +16,8 @@ import {
   GitService,
   GitServiceShape,
 } from "../Services/GitService.ts";
+import { ServerConfig } from "../../config.ts";
+import { buildRemoteExecScript, buildRemoteShellCommand, buildSshArgs } from "../../ssh.ts";
 
 const DEFAULT_TIMEOUT_MS = 30_000;
 const DEFAULT_MAX_OUTPUT_BYTES = 1_000_000;
@@ -79,13 +82,37 @@ const makeGitService = Effect.gen(function* () {
     const maxOutputBytes = input.maxOutputBytes ?? DEFAULT_MAX_OUTPUT_BYTES;
 
     const commandEffect = Effect.gen(function* () {
+      const workspaceTarget = decodeWorkspaceHandle(commandInput.cwd);
+      const serverConfig = yield* Effect.serviceOption(ServerConfig);
+      const stateDir = Option.match(serverConfig, {
+        onNone: () => process.env.T3CODE_STATE_DIR ?? process.cwd(),
+        onSome: (config) => config.stateDir,
+      });
+      const command =
+        workspaceTarget?.kind === "ssh"
+          ? ChildProcess.make(
+              "ssh",
+              [
+                ...buildSshArgs({
+                  hostAlias: workspaceTarget.hostAlias,
+                  stateDir,
+                  remoteCommand: buildRemoteShellCommand(
+                    buildRemoteExecScript({
+                      cwd: workspaceTarget.cwd,
+                      command: "git",
+                      args: commandInput.args,
+                      ...(input.env ? { env: input.env } : {}),
+                    }),
+                  ),
+                }),
+              ],
+            )
+          : ChildProcess.make("git", commandInput.args, {
+              cwd: commandInput.cwd,
+              ...(input.env ? { env: input.env } : {}),
+            });
       const child = yield* commandSpawner
-        .spawn(
-          ChildProcess.make("git", commandInput.args, {
-            cwd: commandInput.cwd,
-            ...(input.env ? { env: input.env } : {}),
-          }),
-        )
+        .spawn(command)
         .pipe(Effect.mapError(toGitCommandError(commandInput, "failed to spawn.")));
 
       const [stdout, stderr, exitCode] = yield* Effect.all(

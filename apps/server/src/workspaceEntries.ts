@@ -2,6 +2,8 @@ import fs from "node:fs/promises";
 import type { Dirent } from "node:fs";
 import path from "node:path";
 import { runProcess } from "./processRunner";
+import { decodeWorkspaceHandle } from "@t3tools/shared/workspace";
+import { quotePosixShellArg, runSshCommand } from "./ssh";
 
 import {
   ProjectEntry,
@@ -60,6 +62,14 @@ function normalizeQuery(input: string): string {
     .trim()
     .replace(/^[@./]+/, "")
     .toLowerCase();
+}
+
+function normalizeRemoteListedPath(input: string): string {
+  const trimmed = input.trim();
+  if (trimmed === "." || trimmed.length === 0) {
+    return "";
+  }
+  return trimmed.replace(/^\.\//, "");
 }
 
 function scoreEntry(entry: ProjectEntry, query: string): number {
@@ -277,6 +287,113 @@ async function buildWorkspaceIndexFromGit(cwd: string): Promise<WorkspaceIndex |
 }
 
 async function buildWorkspaceIndex(cwd: string): Promise<WorkspaceIndex> {
+  const workspaceTarget = decodeWorkspaceHandle(cwd);
+  if (workspaceTarget?.kind === "ssh") {
+    const stateDir = process.env.T3CODE_STATE_DIR ?? process.cwd();
+    const gitIndexed = await runSshCommand({
+      hostAlias: workspaceTarget.hostAlias,
+      stateDir,
+      allowNonZeroExit: true,
+      timeoutMs: 20_000,
+      maxBufferBytes: 16 * 1024 * 1024,
+      outputMode: "truncate",
+      script: `cd ${quotePosixShellArg(workspaceTarget.cwd)} && if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then git ls-files --cached --others --exclude-standard -z; fi`,
+    }).catch(() => null);
+
+    if (gitIndexed && gitIndexed.code === 0 && gitIndexed.stdout.length > 0) {
+      const filePaths = splitNullSeparatedPaths(
+        gitIndexed.stdout,
+        Boolean(gitIndexed.stdoutTruncated),
+      )
+        .map(normalizeRemoteListedPath)
+        .filter((entry) => entry.length > 0 && !isPathInIgnoredDirectory(entry));
+      const directorySet = new Set<string>();
+      for (const filePath of filePaths) {
+        for (const directoryPath of directoryAncestorsOf(filePath)) {
+          if (!isPathInIgnoredDirectory(directoryPath)) {
+            directorySet.add(directoryPath);
+          }
+        }
+      }
+
+      return {
+        scannedAt: Date.now(),
+        entries: [
+          ...[...directorySet]
+            .toSorted((left, right) => left.localeCompare(right))
+            .map((directoryPath) => ({
+              path: directoryPath,
+              kind: "directory" as const,
+              parentPath: parentPathOf(directoryPath),
+            })),
+          ...[...new Set(filePaths)]
+            .toSorted((left, right) => left.localeCompare(right))
+            .map((filePath) => ({
+              path: filePath,
+              kind: "file" as const,
+              parentPath: parentPathOf(filePath),
+            })),
+        ].slice(0, WORKSPACE_INDEX_MAX_ENTRIES),
+        truncated:
+          Boolean(gitIndexed.stdoutTruncated) || filePaths.length > WORKSPACE_INDEX_MAX_ENTRIES,
+      };
+    }
+
+    const listedEntries = await runSshCommand({
+      hostAlias: workspaceTarget.hostAlias,
+      stateDir,
+      timeoutMs: 20_000,
+      maxBufferBytes: 16 * 1024 * 1024,
+      outputMode: "truncate",
+      script: [
+        `cd ${quotePosixShellArg(workspaceTarget.cwd)}`,
+        "find . \\(",
+        [
+          ".git",
+          ".convex",
+          "node_modules",
+          ".next",
+          ".turbo",
+          "dist",
+          "build",
+          "out",
+          ".cache",
+        ]
+          .map((name) => `-name ${quotePosixShellArg(name)}`)
+          .join(" -o "),
+        "\\) -prune -o \\( -type d -exec printf 'd %s\\\\0' {} + -o -type f -exec printf 'f %s\\\\0' {} + \\)",
+      ].join(" "),
+      allowNonZeroExit: true,
+    }).catch(() => null);
+
+    const rawEntries =
+      listedEntries && listedEntries.code === 0
+        ? splitNullSeparatedPaths(listedEntries.stdout, Boolean(listedEntries.stdoutTruncated))
+        : [];
+    const entries = rawEntries
+      .map((entry) => {
+        const kind = entry.startsWith("d ") ? "directory" : entry.startsWith("f ") ? "file" : null;
+        const entryPath = normalizeRemoteListedPath(entry.slice(2));
+        return kind && entryPath.length > 0 && !isPathInIgnoredDirectory(entryPath)
+          ? ({ path: entryPath, kind } as const)
+          : null;
+      })
+      .filter((entry): entry is { path: string; kind: "file" | "directory" } => entry !== null)
+      .toSorted((left, right) => left.path.localeCompare(right.path))
+      .map<ProjectEntry>((entry) => ({
+        path: entry.path,
+        kind: entry.kind,
+        parentPath: parentPathOf(entry.path),
+      }));
+
+    return {
+      scannedAt: Date.now(),
+      entries: entries.slice(0, WORKSPACE_INDEX_MAX_ENTRIES),
+      truncated:
+        Boolean(listedEntries?.stdoutTruncated) || entries.length > WORKSPACE_INDEX_MAX_ENTRIES,
+    };
+  }
+
   const gitIndexed = await buildWorkspaceIndexFromGit(cwd);
   if (gitIndexed) {
     return gitIndexed;
